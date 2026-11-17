@@ -1,0 +1,26 @@
+{
+  "id": "edmonton_yeg",
+  "name": "Edmonton",
+  "region": "Alberta, Canada",
+  "currency": "CAD",
+  "fareSystemName": "ARC Card",
+  "worldBounds": { "width": 4000, "height": 3200 },
+  "worldUnitsPerKm": 100,
+  "startingCamera": { "x": 2000, "y": 1600, "zoom": 0.45 },
+  "climateProfile": "PRAIRIE_WINTER_CITY",
+  "capabilityTraits": {},
+  "elevationObstacles": [
+    {
+      "id": "north_saskatchewan_river_valley",
+      "type": "RIVER_VALLEY_GORGE",
+      "bridgeCostMultiplier": 2.4,
+      "tunnelCostMultiplier": 3.2,
+      "bridgeSlopePenalty": 0.15
+    }
+  ],
+  "defaultLines": [
+    { "badge": "CAP", "name": "Capital Line", "color": "#2563eb", "mode": "LRT_HIGH_FLOOR" },
+    { "badge": "VAL", "name": "Valley Line", "color": "#10b981", "mode": "LRT_LOW_FLOOR" },
+    { "badge": "MET", "name": "Metro Line", "color": "#ef4444", "mode": "LRT_HIGH_FLOOR" }
+  ]
+}
