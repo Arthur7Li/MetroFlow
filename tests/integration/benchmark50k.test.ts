@@ -55,6 +55,7 @@ describe('Milestone 2 Scale Benchmark: 2,500 vehicles & 100,000 daily riders', (
         events: [],
         growthSeed: 'SEED_A',
         sharedBuffer: sab,
+        unlimitedBudget: true,
       },
       false,
     );

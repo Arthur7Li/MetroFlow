@@ -1,9 +1,19 @@
 import type { CityManifest } from '../cities/types';
 import { TRANSIT_MODES } from '../config/modes';
 import {
+  ALL_DOOR_ARC_CAPEX_CAD,
+  CAPEX_TEARDOWN_REFUND_RATIO,
+  LRV_EXTRA_CAR_CAPEX_CAD,
+  MAX_LRV_CONSIST_CARS,
+  MAX_SCENIC_APPROVAL_BONUS_PCT,
+  TSP_CAPEX_PER_KM_CAD,
+  supportsMultiCarConsist,
+} from '../config/upgrades';
+import {
   SIM_SECONDS_PER_REAL_SECOND,
   UNREACHABLE_ID,
   WORKER_FIXED_DT_REAL_SEC,
+  type InspectorTarget,
   type SimSpeed,
   type TelemetrySnapshot,
   type TopologySnapshot,
@@ -22,10 +32,9 @@ import { TransitLineStore, type TransitLineRecord } from './stores/lines';
 import { StationStore } from './stores/stations';
 import { VehicleStoreSoA } from './stores/vehicles';
 import { DemandSystem } from './systems/demandSystem';
+import { EconomySystem } from './systems/economySystem';
 
-const START_TREASURY_CAD = 50_000;
 const INITIAL_HOUR_SECONDS = 6 * 3600 + 30 * 60; // Start campaign day at 06:30 Morning Peak.
-const BASE_ARC_FARE_CAD = 3.5;
 const PATIENCE_CEILING_MIN = 12.0;
 
 /**
@@ -39,22 +48,21 @@ export class WorkerSimulationEngine {
   readonly agents = new AgentStoreSoA();
   readonly pathfinder = new RouteSegmentPathfinder();
   readonly demand = new DemandSystem();
+  readonly economy = new EconomySystem();
 
   private sabWriter: SharedSnapshotWriter | null = null;
   private transferableWriter: TransferableSnapshotWriter | null = null;
   private transportMode: TransportMode = 'TRANSFERABLE';
 
   private speed: SimSpeed = 1;
-  private treasuryCad = START_TREASURY_CAD;
   private tickIndex = 0;
   private simTimeSeconds = INITIAL_HOUR_SECONDS;
-  private currentDayIndex = 0;
 
-  private dailyFareRevenueCad = 0;
   private dailyRidership = 0;
   private dailyCompletedWaitMinSum = 0;
   private dailyCompletedRiderCount = 0;
   private publicApprovalPct = 75;
+  private inspectorTarget: InspectorTarget = { kind: 'NONE' };
 
   private lastTickWallMs = 0;
   private accumulatorRealSec = 0;
@@ -83,7 +91,11 @@ export class WorkerSimulationEngine {
   }
 
   getTreasuryCad(): number {
-    return this.treasuryCad;
+    return this.economy.getTreasuryCad();
+  }
+
+  getBondDebtCad(): number {
+    return this.economy.getBondDebtCad();
   }
 
   getDailyRidership(): number {
@@ -91,7 +103,15 @@ export class WorkerSimulationEngine {
   }
 
   getDailyFareRevenueCad(): number {
-    return this.dailyFareRevenueCad;
+    return this.economy.getDailyFareRevenueCad();
+  }
+
+  getDailyOpExCad(): number {
+    return this.economy.computeDailyOpEx(this.lines.lines, this.stations.stations);
+  }
+
+  getPublicApprovalPct(): number {
+    return this.publicApprovalPct;
   }
 
   handleCommand(cmd: WorkerCommand, startWorkerLoop = true): void {
@@ -99,18 +119,19 @@ export class WorkerSimulationEngine {
       case 'INIT_CITY': {
         this.manifest = cmd.manifest;
         this.stations.initFromSeeds(cmd.nodes);
+        this.lines.reset();
+        this.vehicles.reset();
         this.agents.reset();
+        this.economy.reset(Boolean(cmd.unlimitedBudget));
         this.demand.initCity(this.stations, cmd.manifest.worldUnitsPerKm);
-        this.treasuryCad = START_TREASURY_CAD;
         this.simTimeSeconds = INITIAL_HOUR_SECONDS;
-        this.currentDayIndex = 0;
         this.tickIndex = 0;
         this.speed = 1;
-        this.dailyFareRevenueCad = 0;
         this.dailyRidership = 0;
         this.dailyCompletedWaitMinSum = 0;
         this.dailyCompletedRiderCount = 0;
         this.publicApprovalPct = 75;
+        this.inspectorTarget = { kind: 'NONE' };
 
         if (cmd.sharedBuffer) {
           this.sabWriter = new SharedSnapshotWriter(cmd.sharedBuffer);
@@ -154,9 +175,21 @@ export class WorkerSimulationEngine {
           return;
         }
 
-        this.demand.syncStationMatrix(this.stations);
-        const initialVehicles = cmd.initialVehicles ?? 1;
+        const initialVehicles = Math.max(0, cmd.initialVehicles ?? 1);
         const spec = TRANSIT_MODES[cmd.mode];
+        const totalInitialCapEx = created.trackCapExCad + initialVehicles * spec.vehicleCapEx;
+        const spend = this.economy.spendCapEx(totalInitialCapEx);
+        if (!spend.ok) {
+          this.lines.deleteLine(
+            created.line.lineId,
+            this.stations,
+            this.manifest.worldUnitsPerKm,
+          );
+          this.postOutbound({ type: 'ERROR', message: spend.error });
+          return;
+        }
+
+        this.demand.syncStationMatrix(this.stations);
         const spawnedIds: number[] = [];
         for (let i = 0; i < initialVehicles; i++) {
           const vId = this.vehicles.spawnVehicle(created.line);
@@ -164,7 +197,13 @@ export class WorkerSimulationEngine {
             spawnedIds.push(vId);
           }
         }
-        this.treasuryCad -= created.trackCapExCad + spawnedIds.length * spec.vehicleCapEx;
+        // Refund any unspawned vehicle CapEx if ACTIVE_VEHICLE_SOFT_CAP was reached.
+        if (spawnedIds.length < initialVehicles) {
+          const unspentVehCapEx = (initialVehicles - spawnedIds.length) * spec.vehicleCapEx;
+          this.economy.refundCapEx(unspentVehCapEx / CAPEX_TEARDOWN_REFUND_RATIO);
+        }
+        created.line.investedCapExCad =
+          created.trackCapExCad + spawnedIds.length * spec.vehicleCapEx;
 
         this.pathfinder.scheduleRebuild(this.stations, this.lines, 1.0, 1.0, created.line.stationIds);
         this.pathfinder.stepRebuild(this.stations, 32);
@@ -177,6 +216,124 @@ export class WorkerSimulationEngine {
           this.processStationStop(vId, startStationId, created.line);
         }
 
+        this.recomputePublicApproval();
+        this.publishSnapshot(0);
+        this.emitTopology();
+        this.emitTelemetry();
+        break;
+      }
+
+      case 'DELETE_LINE': {
+        if (!this.manifest) {
+          return;
+        }
+        const line = this.lines.getById(cmd.lineId);
+        if (!line) {
+          return;
+        }
+        for (const vId of line.vehicleIds) {
+          this.evacuateVehiclePassengers(vId, line);
+        }
+        this.vehicles.removeAllVehiclesForLine(line);
+        this.economy.refundCapEx(line.investedCapExCad);
+        this.lines.deleteLine(cmd.lineId, this.stations, this.manifest.worldUnitsPerKm);
+
+        this.pathfinder.scheduleRebuild(this.stations, this.lines, 1.0, 1.0);
+        this.pathfinder.stepRebuild(this.stations, 32);
+        this.recomputePublicApproval();
+        this.publishSnapshot(0);
+        this.emitTopology();
+        this.emitTelemetry();
+        break;
+      }
+
+      case 'UPGRADE_CORRIDOR': {
+        if (!this.manifest) {
+          return;
+        }
+        const preview = this.lines.previewUpgradeCorridor(cmd.lineId, cmd.targetMode);
+        if ('error' in preview) {
+          this.postOutbound({ type: 'ERROR', message: preview.error });
+          return;
+        }
+
+        const line = preview.line;
+        const oldSpec = TRANSIT_MODES[line.mode];
+        const newSpec = TRANSIT_MODES[cmd.targetMode];
+        const oldPerVehCapEx =
+          oldSpec.vehicleCapEx + Math.max(0, line.consistCars - 1) * LRV_EXTRA_CAR_CAPEX_CAD;
+        const trackDeltaCad = Math.max(
+          0,
+          preview.newTrackCapExCad - Math.round(preview.oldTrackCapExCad * CAPEX_TEARDOWN_REFUND_RATIO),
+        );
+        const vehicleDeltaCad =
+          line.vehicleIds.length *
+          Math.max(
+            0,
+            newSpec.vehicleCapEx - Math.round(oldPerVehCapEx * CAPEX_TEARDOWN_REFUND_RATIO),
+          );
+        const totalDelta = trackDeltaCad + vehicleDeltaCad;
+
+        const spend = this.economy.spendCapEx(totalDelta);
+        if (!spend.ok) {
+          this.postOutbound({ type: 'ERROR', message: spend.error });
+          return;
+        }
+
+        this.lines.applyUpgradeCorridor(
+          line,
+          cmd.targetMode,
+          preview.newTrackCapExCad,
+          preview.upgradedCrossings,
+          this.stations,
+          this.manifest.worldUnitsPerKm,
+        );
+        line.investedCapExCad += totalDelta;
+        this.vehicles.syncLineFleetSpec(line);
+        this.vehicles.clampVehiclesAfterStopEdit(line);
+
+        this.pathfinder.scheduleRebuild(this.stations, this.lines, 1.0, 1.0, line.stationIds);
+        this.pathfinder.stepRebuild(this.stations, 32);
+        this.recomputePublicApproval();
+        this.publishSnapshot(0);
+        this.emitTopology();
+        this.emitTelemetry();
+        break;
+      }
+
+      case 'EDIT_LINE_STOPS': {
+        if (!this.manifest) {
+          return;
+        }
+        const res = this.lines.editLineStops(
+          cmd.lineId,
+          cmd.waypoints,
+          this.stations,
+          this.manifest.worldUnitsPerKm,
+          (deltaCad) =>
+            this.economy.canAfford(deltaCad)
+              ? { ok: true }
+              : { ok: false, error: 'Insufficient Treasury/Bond Overdraft to extend corridor.' },
+        );
+        if ('error' in res) {
+          this.postOutbound({ type: 'ERROR', message: res.error });
+          return;
+        }
+
+        const trackDelta = res.newTrackCapExCad - res.oldTrackCapExCad;
+        if (trackDelta > 0) {
+          this.economy.spendCapEx(trackDelta);
+          res.line.investedCapExCad += trackDelta;
+        } else if (trackDelta < 0) {
+          this.economy.refundCapEx(-trackDelta);
+          res.line.investedCapExCad = Math.max(0, res.line.investedCapExCad + trackDelta);
+        }
+
+        this.demand.syncStationMatrix(this.stations);
+        this.vehicles.clampVehiclesAfterStopEdit(res.line);
+        this.pathfinder.scheduleRebuild(this.stations, this.lines, 1.0, 1.0, res.line.stationIds);
+        this.pathfinder.stepRebuild(this.stations, 32);
+        this.recomputePublicApproval();
         this.publishSnapshot(0);
         this.emitTopology();
         this.emitTelemetry();
@@ -190,6 +347,17 @@ export class WorkerSimulationEngine {
         }
         const count = Math.max(1, cmd.count ?? 1);
         const spec = TRANSIT_MODES[line.mode];
+        const perVehicleCapEx =
+          spec.vehicleCapEx + Math.max(0, line.consistCars - 1) * LRV_EXTRA_CAR_CAPEX_CAD;
+
+        if (!this.economy.canAfford(count * perVehicleCapEx)) {
+          this.postOutbound({
+            type: 'ERROR',
+            message: `Insufficient funds for ${count}x ${spec.name} unit ($${(count * perVehicleCapEx).toLocaleString('en-CA')} CAD).`,
+          });
+          return;
+        }
+
         const spawnedIds: number[] = [];
         for (let i = 0; i < count; i++) {
           const vId = this.vehicles.spawnVehicle(line);
@@ -198,7 +366,10 @@ export class WorkerSimulationEngine {
           }
         }
         if (spawnedIds.length > 0) {
-          this.treasuryCad -= spawnedIds.length * spec.vehicleCapEx;
+          const totalSpend = spawnedIds.length * perVehicleCapEx;
+          this.economy.spendCapEx(totalSpend);
+          line.investedCapExCad += totalSpend;
+
           if (this.pathfinder.checkSignificantShift(this.lines, 1.0, 1.0)) {
             this.pathfinder.scheduleRebuild(this.stations, this.lines, 1.0, 1.0, line.stationIds);
           }
@@ -216,6 +387,199 @@ export class WorkerSimulationEngine {
         break;
       }
 
+      case 'SELL_VEHICLE': {
+        const line = this.lines.getById(cmd.lineId);
+        if (!line || line.vehicleIds.length === 0) {
+          return;
+        }
+        const count = Math.max(1, Math.min(line.vehicleIds.length, cmd.count ?? 1));
+        const spec = TRANSIT_MODES[line.mode];
+        const perVehicleCapEx =
+          spec.vehicleCapEx + Math.max(0, line.consistCars - 1) * LRV_EXTRA_CAR_CAPEX_CAD;
+
+        let soldCount = 0;
+        for (let i = 0; i < count; i++) {
+          const vId = this.vehicles.sellLastVehicle(line);
+          if (vId !== -1) {
+            this.evacuateVehiclePassengers(vId, line);
+            soldCount += 1;
+          }
+        }
+        if (soldCount > 0) {
+          const originalCost = soldCount * perVehicleCapEx;
+          this.economy.refundCapEx(originalCost);
+          line.investedCapExCad = Math.max(0, line.investedCapExCad - originalCost);
+
+          if (line.vehicleIds.length === 0 || this.pathfinder.checkSignificantShift(this.lines, 1.0, 1.0)) {
+            this.pathfinder.scheduleRebuild(this.stations, this.lines, 1.0, 1.0, line.stationIds);
+          }
+          this.publishSnapshot(0);
+          this.emitTopology();
+          this.emitTelemetry();
+        }
+        break;
+      }
+
+      case 'SET_CONSIST_CARS': {
+        const line = this.lines.getById(cmd.lineId);
+        if (!line) {
+          return;
+        }
+        if (!supportsMultiCarConsist(line.mode)) {
+          this.postOutbound({
+            type: 'ERROR',
+            message: `${TRANSIT_MODES[line.mode].name} does not support multi-car LRV consists.`,
+          });
+          return;
+        }
+        const targetCars = Math.max(1, Math.min(MAX_LRV_CONSIST_CARS, cmd.consistCars)) as
+          | 1
+          | 2
+          | 3
+          | 4;
+        if (targetCars === line.consistCars) {
+          return;
+        }
+
+        const diffCars = targetCars - line.consistCars;
+        const capExAmount = line.vehicleIds.length * Math.abs(diffCars) * LRV_EXTRA_CAR_CAPEX_CAD;
+
+        if (diffCars > 0) {
+          const spend = this.economy.spendCapEx(capExAmount);
+          if (!spend.ok) {
+            this.postOutbound({ type: 'ERROR', message: spend.error });
+            return;
+          }
+          line.investedCapExCad += capExAmount;
+        } else {
+          this.economy.refundCapEx(capExAmount);
+          line.investedCapExCad = Math.max(0, line.investedCapExCad - capExAmount);
+        }
+
+        line.consistCars = targetCars;
+        this.vehicles.syncLineFleetSpec(line);
+        this.pathfinder.scheduleRebuild(this.stations, this.lines, 1.0, 1.0, line.stationIds);
+        this.pathfinder.stepRebuild(this.stations, 32);
+        this.publishSnapshot(0);
+        this.emitTopology();
+        this.emitTelemetry();
+        break;
+      }
+
+      case 'SET_ALL_DOOR_ARC': {
+        const line = this.lines.getById(cmd.lineId);
+        if (!line || line.allDoorArc === cmd.enabled) {
+          return;
+        }
+        if (cmd.enabled) {
+          const spend = this.economy.spendCapEx(ALL_DOOR_ARC_CAPEX_CAD);
+          if (!spend.ok) {
+            this.postOutbound({ type: 'ERROR', message: spend.error });
+            return;
+          }
+          line.investedCapExCad += ALL_DOOR_ARC_CAPEX_CAD;
+        } else {
+          this.economy.refundCapEx(ALL_DOOR_ARC_CAPEX_CAD);
+          line.investedCapExCad = Math.max(0, line.investedCapExCad - ALL_DOOR_ARC_CAPEX_CAD);
+        }
+        line.allDoorArc = cmd.enabled;
+        this.pathfinder.scheduleRebuild(this.stations, this.lines, 1.0, 1.0, line.stationIds);
+        this.pathfinder.stepRebuild(this.stations, 32);
+        this.emitTelemetry();
+        break;
+      }
+
+      case 'SET_CORRIDOR_TSP': {
+        const line = this.lines.getById(cmd.lineId);
+        if (!line) {
+          return;
+        }
+        if (line.mode !== 'LRT_LOW_FLOOR') {
+          this.postOutbound({
+            type: 'ERROR',
+            message: 'Transit Signal Priority (TSP) applies only to Tier 3 Low-Floor Tram lines.',
+          });
+          return;
+        }
+        if (line.tspEnabled === cmd.enabled) {
+          return;
+        }
+        const tspCost = Math.round(line.totalLengthKm * TSP_CAPEX_PER_KM_CAD);
+        if (cmd.enabled) {
+          const spend = this.economy.spendCapEx(tspCost);
+          if (!spend.ok) {
+            this.postOutbound({ type: 'ERROR', message: spend.error });
+            return;
+          }
+          line.investedCapExCad += tspCost;
+        } else {
+          this.economy.refundCapEx(tspCost);
+          line.investedCapExCad = Math.max(0, line.investedCapExCad - tspCost);
+        }
+        line.tspEnabled = cmd.enabled;
+        this.pathfinder.scheduleRebuild(this.stations, this.lines, 1.0, 1.0, line.stationIds);
+        this.pathfinder.stepRebuild(this.stations, 32);
+        this.emitTelemetry();
+        break;
+      }
+
+      case 'UPGRADE_STATION_CONCOURSE': {
+        const costInfo = this.stations.getConcourseTransitionCost(cmd.stationId, cmd.targetTier);
+        if (!costInfo) {
+          return;
+        }
+        if (costInfo.capExCostCad > 0) {
+          const spend = this.economy.spendCapEx(costInfo.capExCostCad);
+          if (!spend.ok) {
+            this.postOutbound({ type: 'ERROR', message: spend.error });
+            return;
+          }
+        } else if (costInfo.refundOriginalCad > 0) {
+          this.economy.refundCapEx(costInfo.refundOriginalCad);
+        }
+
+        this.stations.setConcourseTier(cmd.stationId, cmd.targetTier);
+        this.pathfinder.scheduleRebuild(this.stations, this.lines, 1.0, 1.0, [cmd.stationId]);
+        this.pathfinder.stepRebuild(this.stations, 32);
+        this.publishSnapshot(0);
+        this.emitTopology();
+        this.emitTelemetry();
+        break;
+      }
+
+      case 'TOGGLE_PARK_AND_RIDE': {
+        const costInfo = this.stations.getParkAndRideTransitionCost(cmd.stationId, cmd.enabled);
+        if (!costInfo) {
+          return;
+        }
+        if (costInfo.capExCostCad > 0) {
+          const spend = this.economy.spendCapEx(costInfo.capExCostCad);
+          if (!spend.ok) {
+            this.postOutbound({ type: 'ERROR', message: spend.error });
+            return;
+          }
+        } else if (costInfo.refundOriginalCad > 0) {
+          this.economy.refundCapEx(costInfo.refundOriginalCad);
+        }
+
+        this.stations.setParkAndRideActive(cmd.stationId, cmd.enabled);
+        this.demand.syncStationMatrix(this.stations);
+        this.publishSnapshot(0);
+        this.emitTopology();
+        this.emitTelemetry();
+        break;
+      }
+
+      case 'SELECT_INSPECTOR_TARGET':
+        this.inspectorTarget = cmd.target;
+        this.emitTelemetry();
+        break;
+
+      case 'REPAY_BOND':
+        this.economy.repayBond(cmd.amountCad);
+        this.emitTelemetry();
+        break;
+
       case 'RETURN_SNAPSHOT_BUFFER':
         this.transferableWriter?.reclaimBuffer(cmd.buffer);
         break;
@@ -223,6 +587,35 @@ export class WorkerSimulationEngine {
       default:
         break;
     }
+  }
+
+  private evacuateVehiclePassengers(vehicleId: number, line: TransitLineRecord): void {
+    const segIdx = Math.min(
+      this.vehicles.segmentIdx[vehicleId],
+      Math.max(0, line.segments.length - 1),
+    );
+    const seg = line.segments[segIdx];
+    const fallbackStationId = seg
+      ? this.vehicles.direction[vehicleId] >= 0
+        ? seg.fromStationId
+        : seg.toStationId
+      : line.stationIds[0];
+
+    let cur = this.agents.headAgentByVehicle[vehicleId];
+    while (cur !== -1) {
+      const next = this.agents.nextInNode[cur];
+      const count = this.agents.passengerCount[cur];
+      const dest = this.agents.destStationId[cur];
+      this.agents.unlinkFromVehicle(cur, vehicleId);
+      if (fallbackStationId !== undefined && fallbackStationId !== dest) {
+        this.agents.enqueueAtStation(cur, fallbackStationId, this.simTimeSeconds);
+        this.stations.addWaitingCount(fallbackStationId, count);
+      } else {
+        this.agents.freeSlot(cur);
+      }
+      cur = next;
+    }
+    this.vehicles.onboardCount[vehicleId] = 0;
   }
 
   private startLoop(): void {
@@ -263,10 +656,12 @@ export class WorkerSimulationEngine {
       overrideDtSimSeconds ?? WORKER_FIXED_DT_REAL_SEC * SIM_SECONDS_PER_REAL_SECOND * this.speed;
 
     this.simTimeSeconds += dtSimSeconds;
-    const nextDayIdx = Math.floor(this.simTimeSeconds / 86_400);
-    if (nextDayIdx > this.currentDayIndex) {
-      this.currentDayIndex = nextDayIdx;
-      this.dailyFareRevenueCad = 0;
+    const rollover = this.economy.stepDayAndWeekRollover(
+      this.simTimeSeconds,
+      this.lines.lines,
+      this.stations.stations,
+    );
+    if (rollover.dayRolledOver) {
       this.dailyRidership = 0;
       this.dailyCompletedWaitMinSum = 0;
       this.dailyCompletedRiderCount = 0;
@@ -275,7 +670,10 @@ export class WorkerSimulationEngine {
 
     if (this.pathfinder.isRebuildInProgress()) {
       this.pathfinder.stepRebuild(this.stations, 32);
-    } else if (this.lines.lines.length > 0 && this.pathfinder.checkSignificantShift(this.lines, 1.0, 1.0)) {
+    } else if (
+      this.lines.lines.length > 0 &&
+      this.pathfinder.checkSignificantShift(this.lines, 1.0, 1.0)
+    ) {
       this.pathfinder.scheduleRebuild(this.stations, this.lines, 1.0, 1.0);
       this.pathfinder.stepRebuild(this.stations, 32);
     }
@@ -288,9 +686,9 @@ export class WorkerSimulationEngine {
       this.agents,
     );
 
-    this.vehicles.stepVehicles(dtSimSeconds, this.lines, (vId, stationId, line) => {
-      this.processStationStop(vId, stationId, line);
-    });
+    this.vehicles.stepVehicles(dtSimSeconds, this.lines, (vId, stationId, line) =>
+      this.processStationStop(vId, stationId, line),
+    );
 
     this.tickIndex += 1;
     const durationMs = performance.now() - startMs;
@@ -301,8 +699,9 @@ export class WorkerSimulationEngine {
   /**
    * O(k) vehicle stop handler: alights cohorts arriving at their destination or transfer hub,
    * credits $3.50 ARC fares on trip completion, and boards waiting cohorts in strict FIFO order.
+   * Returns total riders boarded at this stop for dynamic dwell calculation.
    */
-  processStationStop(vehicleId: number, stationId: number, line: TransitLineRecord): void {
+  processStationStop(vehicleId: number, stationId: number, line: TransitLineRecord): number {
     const agents = this.agents;
     const vehicles = this.vehicles;
 
@@ -319,10 +718,7 @@ export class WorkerSimulationEngine {
         vehicles.onboardCount[vehicleId] = Math.max(0, vehicles.onboardCount[vehicleId] - count);
 
         if (dest === stationId) {
-          // Trip complete: collect ARC fare & update rolling satisfaction.
-          const fare = count * BASE_ARC_FARE_CAD;
-          this.treasuryCad += fare;
-          this.dailyFareRevenueCad += fare;
+          this.economy.collectFare(count);
           this.dailyRidership += count;
 
           const totalWaitMin = agents.waitTimer[curOnVehicle] / 60;
@@ -332,7 +728,6 @@ export class WorkerSimulationEngine {
 
           agents.freeSlot(curOnVehicle);
         } else {
-          // Transfer hub: re-enqueue onto station FIFO waiting queue for connecting leg.
           agents.enqueueAtStation(curOnVehicle, stationId, this.simTimeSeconds);
           this.stations.addWaitingCount(stationId, count);
         }
@@ -355,10 +750,12 @@ export class WorkerSimulationEngine {
     // 2. Boarding pass (O(k) over station's FIFO waiting queue).
     let remainingCap = vehicles.capacity[vehicleId] - vehicles.onboardCount[vehicleId];
     if (remainingCap <= 0) {
-      return;
+      return 0;
     }
 
-    const lineLoadRatio = vehicles.onboardCount[vehicleId] / Math.max(1, vehicles.capacity[vehicleId]);
+    let boardedCount = 0;
+    const lineLoadRatio =
+      vehicles.onboardCount[vehicleId] / Math.max(1, vehicles.capacity[vehicleId]);
     let curWaiting = agents.headAgentByStation[stationId];
 
     while (curWaiting !== -1 && remainingCap > 0) {
@@ -371,7 +768,6 @@ export class WorkerSimulationEngine {
       if (primLine === line.lineId) {
         targetAlight = this.pathfinder.getAlightStation(stationId, dest);
       } else if (altLine === line.lineId && primLine !== UNREACHABLE_ID) {
-        // Capacity-proportional split on parallel trunk corridors when vehicle/corridor load is elevated.
         const primCap = this.pathfinder.getLineCapacity(primLine);
         const altCap = this.pathfinder.getLineCapacity(altLine);
         const altShare = Math.min(0.5, altCap / Math.max(1, primCap + altCap));
@@ -389,6 +785,7 @@ export class WorkerSimulationEngine {
           agents.enqueueOnVehicle(curWaiting, vehicleId, targetAlight);
           vehicles.onboardCount[vehicleId] += count;
           remainingCap -= count;
+          boardedCount += count;
         } else {
           const splitSlot = agents.splitForVehicle(
             curWaiting,
@@ -400,9 +797,9 @@ export class WorkerSimulationEngine {
           if (splitSlot !== -1) {
             this.stations.addWaitingCount(stationId, -remainingCap);
             vehicles.onboardCount[vehicleId] += remainingCap;
+            boardedCount += remainingCap;
             remainingCap = 0;
           } else {
-            // Pool at 100% capacity with zero split slots left: leave cohort waiting intact.
             break;
           }
         }
@@ -410,6 +807,8 @@ export class WorkerSimulationEngine {
 
       curWaiting = next;
     }
+
+    return boardedCount;
   }
 
   private getLineLoadRatio(lineId: number): number {
@@ -433,9 +832,13 @@ export class WorkerSimulationEngine {
         : 0;
     const satisfactionScore = 100 * Math.max(0, 1 - avgWaitMin / PATIENCE_CEILING_MIN);
     const modeShare = this.demand.getModeSharePct();
+    const scenicBonus = Math.min(
+      MAX_SCENIC_APPROVAL_BONUS_PCT,
+      this.lines.countActiveTransitBridgeCrossings() * 5,
+    );
     this.publicApprovalPct = Math.max(
       0,
-      Math.min(100, Math.round(0.55 * satisfactionScore + 0.35 * modeShare + 15)),
+      Math.min(100, Math.round(0.55 * satisfactionScore + 0.35 * modeShare + 15 + scenicBonus)),
     );
   }
 
@@ -486,6 +889,8 @@ export class WorkerSimulationEngine {
         zone: s.zone,
         subTag: s.subTag,
         concourseTier: s.concourseTier,
+        parkAndRideActive: s.parkAndRideActive,
+        baseProduction: s.baseProduction,
         todLevel: s.todLevel,
         carryingCapacity: s.carryingCapacity,
       })),
@@ -493,6 +898,24 @@ export class WorkerSimulationEngine {
       feederZones: [],
     };
     this.postOutbound({ type: 'TOPOLOGY_SYNC', topology });
+  }
+
+  private buildSelectedInspectorData(): unknown {
+    if (this.inspectorTarget.kind === 'STATION') {
+      const st = this.stations.getById(this.inspectorTarget.stationId);
+      return st
+        ? {
+            kind: 'STATION',
+            stationId: st.stationId,
+            waitingCount: st.waitingCount,
+            concourseTier: st.concourseTier,
+            parkAndRideActive: st.parkAndRideActive,
+            baseProduction: st.baseProduction,
+            carryingCapacity: st.carryingCapacity,
+          }
+        : null;
+    }
+    return null;
   }
 
   private emitTelemetry(): void {
@@ -503,19 +926,16 @@ export class WorkerSimulationEngine {
     const hh = String(Math.floor(daySec / 3600)).padStart(2, '0');
     const mm = String(Math.floor((daySec % 3600) / 60)).padStart(2, '0');
 
-    let dailyOpExCad = 0;
-    for (const line of this.lines.lines) {
-      dailyOpExCad += line.vehicleIds.length * TRANSIT_MODES[line.mode].dailyOpExPerUnit;
-    }
+    const dailyOpExCad = this.economy.computeDailyOpEx(this.lines.lines, this.stations.stations);
 
     const telemetry: TelemetrySnapshot = {
       simDay,
       simWeek,
       simHourMinute: `${hh}:${mm}`,
       speed: this.speed,
-      treasuryCad: Math.round(this.treasuryCad),
-      bondDebtCad: 0,
-      dailyFareRevenueCad: Math.round(this.dailyFareRevenueCad),
+      treasuryCad: Math.round(this.economy.getTreasuryCad()),
+      bondDebtCad: Math.round(this.economy.getBondDebtCad()),
+      dailyFareRevenueCad: Math.round(this.economy.getDailyFareRevenueCad()),
       dailyTodTaxCad: 0,
       dailyOpExCad,
       dailyRidership: this.dailyRidership,
@@ -538,9 +958,15 @@ export class WorkerSimulationEngine {
         mode: l.mode,
         vehicleCount: l.vehicleIds.length,
         stationCount: l.stationIds.length,
+        stationIds: [...l.stationIds],
         lengthKm: Number(l.totalLengthKm.toFixed(2)),
+        allDoorArc: l.allDoorArc,
+        tspEnabled: l.tspEnabled,
+        consistCars: l.consistCars,
+        totalCapExCad: l.investedCapExCad,
+        dailyOpExCad: this.economy.computeLineDailyOpEx(l),
       })),
-      selectedInspectorData: null,
+      selectedInspectorData: this.buildSelectedInspectorData(),
     };
 
     this.postOutbound({ type: 'TELEMETRY_SYNC', telemetry });

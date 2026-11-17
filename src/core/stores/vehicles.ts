@@ -1,13 +1,19 @@
 import { TRANSIT_MODES } from '../../config/modes';
+import { ALL_DOOR_ARC_DWELL_MULT } from '../../config/upgrades';
 import { ACTIVE_VEHICLE_SOFT_CAP, MAX_VEHICLES } from '../contracts';
 import type { VehicleRenderSoA } from '../memory/sharedBuffers';
-import { sampleSegmentAtDistance, type TransitLineRecord, type TransitLineStore } from './lines';
+import {
+  computeSegmentEffectiveCruiseMps,
+  sampleSegmentAtDistance,
+  type TransitLineRecord,
+  type TransitLineStore,
+} from './lines';
 
 const ACCEL_MPS2 = 1.2;
 const DECEL_MPS2 = 1.5;
 const INTERMEDIATE_DWELL_SEC = 3.0;
 const TERMINUS_DWELL_SEC = 15.0;
-const BRIDGE_SLOPE_FACTOR = 0.85;
+const MAX_DYNAMIC_BOARD_DWELL_SEC = 18.0;
 
 export class VehicleStoreSoA {
   readonly active = new Uint8Array(MAX_VEHICLES);
@@ -29,6 +35,27 @@ export class VehicleStoreSoA {
 
   private activeCount = 0;
   private highWaterMark = 0;
+
+  reset(): void {
+    this.active.fill(0);
+    this.lineId.fill(0);
+    this.modeTier.fill(0);
+    this.segmentIdx.fill(0);
+    this.distanceAlongSegmentM.fill(0);
+    this.velocityMps.fill(0);
+    this.direction.fill(0);
+    this.dwellTimerS.fill(0);
+    this.consistCars.fill(0);
+    this.capacity.fill(0);
+    this.onboardCount.fill(0);
+    this.prevX.fill(0);
+    this.prevY.fill(0);
+    this.currX.fill(0);
+    this.currY.fill(0);
+    this.bearing.fill(0);
+    this.activeCount = 0;
+    this.highWaterMark = 0;
+  }
 
   getActiveCount(): number {
     return this.activeCount;
@@ -70,8 +97,8 @@ export class VehicleStoreSoA {
     this.velocityMps[idx] = 0;
     this.direction[idx] = dir;
     this.dwellTimerS[idx] = 0;
-    this.consistCars[idx] = 1;
-    this.capacity[idx] = spec.capacityPerUnit;
+    this.consistCars[idx] = line.consistCars;
+    this.capacity[idx] = spec.capacityPerUnit * line.consistCars;
     this.onboardCount[idx] = 0;
     this.prevX[idx] = sample.x;
     this.prevY[idx] = sample.y;
@@ -87,10 +114,75 @@ export class VehicleStoreSoA {
     return idx;
   }
 
+  sellLastVehicle(line: TransitLineRecord): number {
+    const vId = line.vehicleIds.pop();
+    if (vId === undefined) {
+      return -1;
+    }
+    if (this.active[vId] === 1) {
+      this.active[vId] = 0;
+      this.onboardCount[vId] = 0;
+      this.activeCount = Math.max(0, this.activeCount - 1);
+    }
+    return vId;
+  }
+
+  removeAllVehiclesForLine(line: TransitLineRecord): number[] {
+    const removed = [...line.vehicleIds];
+    for (const vId of removed) {
+      if (this.active[vId] === 1) {
+        this.active[vId] = 0;
+        this.onboardCount[vId] = 0;
+        this.activeCount = Math.max(0, this.activeCount - 1);
+      }
+    }
+    line.vehicleIds.length = 0;
+    return removed;
+  }
+
+  syncLineFleetSpec(line: TransitLineRecord): void {
+    const spec = TRANSIT_MODES[line.mode];
+    for (const vId of line.vehicleIds) {
+      if (this.active[vId] === 0) {
+        continue;
+      }
+      this.modeTier[vId] = spec.tier;
+      this.consistCars[vId] = line.consistCars;
+      this.capacity[vId] = spec.capacityPerUnit * line.consistCars;
+    }
+  }
+
+  clampVehiclesAfterStopEdit(line: TransitLineRecord): void {
+    if (line.segments.length === 0) {
+      return;
+    }
+    for (const vId of line.vehicleIds) {
+      if (this.active[vId] === 0) {
+        continue;
+      }
+      const segIdx = Math.min(this.segmentIdx[vId], line.segments.length - 1);
+      this.segmentIdx[vId] = segIdx;
+      const seg = line.segments[segIdx];
+      this.distanceAlongSegmentM[vId] = Math.max(
+        0,
+        Math.min(seg.lengthMeters, this.distanceAlongSegmentM[vId]),
+      );
+      const dir: 1 | -1 = this.direction[vId] >= 0 ? 1 : -1;
+      const sample = sampleSegmentAtDistance(seg, this.distanceAlongSegmentM[vId], dir);
+      this.prevX[vId] = sample.x;
+      this.prevY[vId] = sample.y;
+      this.currX[vId] = sample.x;
+      this.currY[vId] = sample.y;
+      this.bearing[vId] = sample.bearing;
+    }
+  }
+
   stepVehicles(
     dtSimSeconds: number,
     lineStore: TransitLineStore,
-    onStationStop?: (vehicleId: number, stationId: number, line: TransitLineRecord) => void,
+    onStationStop?: (vehicleId: number, stationId: number, line: TransitLineRecord) => number | void,
+    weatherBusMult = 1.0,
+    weatherRailMult = 1.0,
   ): void {
     if (dtSimSeconds <= 0 || this.highWaterMark === 0) {
       return;
@@ -119,10 +211,12 @@ export class VehicleStoreSoA {
       const seg = line.segments[segIndex];
       const dir: 1 | -1 = this.direction[v] >= 0 ? 1 : -1;
 
-      const spec = TRANSIT_MODES[line.mode];
-      const baseCruiseMps = spec.cruiseSpeedKmh / 3.6;
-      const slopeMult = seg.crossingType === 'TRANSIT_BRIDGE' ? BRIDGE_SLOPE_FACTOR : 1.0;
-      const targetSpeed = baseCruiseMps * slopeMult;
+      const targetSpeed = computeSegmentEffectiveCruiseMps(
+        line,
+        seg,
+        weatherBusMult,
+        weatherRailMult,
+      );
 
       const remainingDist =
         dir === 1 ? seg.lengthMeters - this.distanceAlongSegmentM[v] : this.distanceAlongSegmentM[v];
@@ -138,35 +232,44 @@ export class VehicleStoreSoA {
         nextVel = targetSpeed;
       }
 
-      let nextDist = this.distanceAlongSegmentM[v] + dir * nextVel * dtSimSeconds;
+      const nextDist = this.distanceAlongSegmentM[v] + dir * nextVel * dtSimSeconds;
+      const dwellMult = line.allDoorArc ? ALL_DOOR_ARC_DWELL_MULT : 1.0;
 
       if (dir === 1 && nextDist >= seg.lengthMeters) {
         const arrivedStationId = seg.toStationId;
-        if (segIndex < line.segments.length - 1) {
+        const isTerminus = segIndex >= line.segments.length - 1;
+        if (!isTerminus) {
           this.segmentIdx[v] = segIndex + 1;
           this.distanceAlongSegmentM[v] = 0;
-          this.dwellTimerS[v] = INTERMEDIATE_DWELL_SEC;
         } else {
           this.distanceAlongSegmentM[v] = seg.lengthMeters;
           this.direction[v] = -1;
-          this.dwellTimerS[v] = TERMINUS_DWELL_SEC;
         }
         this.velocityMps[v] = 0;
-        onStationStop?.(v, arrivedStationId, line);
+        const boarded = onStationStop?.(v, arrivedStationId, line) ?? 0;
+        this.dwellTimerS[v] =
+          (isTerminus
+            ? TERMINUS_DWELL_SEC
+            : Math.min(MAX_DYNAMIC_BOARD_DWELL_SEC, INTERMEDIATE_DWELL_SEC + 0.5 * boarded)) *
+          dwellMult;
       } else if (dir === -1 && nextDist <= 0) {
         const arrivedStationId = seg.fromStationId;
-        if (segIndex > 0) {
+        const isTerminus = segIndex <= 0;
+        if (!isTerminus) {
           const prevSeg = line.segments[segIndex - 1];
           this.segmentIdx[v] = segIndex - 1;
           this.distanceAlongSegmentM[v] = prevSeg.lengthMeters;
-          this.dwellTimerS[v] = INTERMEDIATE_DWELL_SEC;
         } else {
           this.distanceAlongSegmentM[v] = 0;
           this.direction[v] = 1;
-          this.dwellTimerS[v] = TERMINUS_DWELL_SEC;
         }
         this.velocityMps[v] = 0;
-        onStationStop?.(v, arrivedStationId, line);
+        const boarded = onStationStop?.(v, arrivedStationId, line) ?? 0;
+        this.dwellTimerS[v] =
+          (isTerminus
+            ? TERMINUS_DWELL_SEC
+            : Math.min(MAX_DYNAMIC_BOARD_DWELL_SEC, INTERMEDIATE_DWELL_SEC + 0.5 * boarded)) *
+          dwellMult;
       } else {
         this.distanceAlongSegmentM[v] = nextDist;
         this.velocityMps[v] = nextVel;
@@ -195,6 +298,7 @@ export class VehicleStoreSoA {
       target.bearing[i] = this.bearing[i];
       target.lineId[i] = this.lineId[i];
       target.modeTier[i] = this.modeTier[i];
+      target.consistCars[i] = this.consistCars[i] || 1;
       const cap = this.capacity[i] || 1;
       target.loadRatio[i] = Math.min(255, Math.round((this.onboardCount[i] / cap) * 255));
     }

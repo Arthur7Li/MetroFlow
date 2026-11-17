@@ -33,7 +33,7 @@ export class VehicleLayer {
         position: true,
         rotation: true,
         color: true,
-        scale: false,
+        scale: true,
       },
     });
     this.container.addChild(this.particleContainer);
@@ -56,6 +56,7 @@ export class VehicleLayer {
       const y = vehicles.prevY[i] + (vehicles.currY[i] - vehicles.prevY[i]) * alpha;
       const rotation = vehicles.bearing[i];
       const tint = MODE_COLORS[vehicles.modeTier[i]] ?? 0x38bdf8;
+      const cars = Math.max(1, vehicles.consistCars[i] || 1);
 
       let particle = this.pool[visibleIdx];
       if (!particle) {
@@ -73,6 +74,8 @@ export class VehicleLayer {
       particle.x = x;
       particle.y = y;
       particle.rotation = rotation;
+      particle.scaleX = 1.25 + (cars - 1) * 0.45;
+      particle.scaleY = 1.25;
       particle.tint = tint;
       particle.alpha = 1;
       visibleIdx += 1;

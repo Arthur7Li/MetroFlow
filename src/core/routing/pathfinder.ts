@@ -1,17 +1,15 @@
 import { TRANSIT_MODES } from '../../config/modes';
+import { ALL_DOOR_ARC_DWELL_MULT, CONCOURSE_UPGRADES } from '../../config/upgrades';
 import { MAX_STATIONS, UNREACHABLE_ID } from '../contracts';
-import type { TransitLineRecord, TransitLineStore } from '../stores/lines';
+import {
+  computeSegmentEffectiveCruiseMps,
+  type TransitLineRecord,
+  type TransitLineStore,
+} from '../stores/lines';
 import type { StationStore } from '../stores/stations';
-
-const CONCOURSE_PENALTY_SEC: Record<0 | 1 | 2, number> = {
-  0: 240,
-  1: 120,
-  2: 60,
-};
 
 const INTERMEDIATE_DWELL_SEC = 3.0;
 const TERMINUS_TURNAROUND_SEC = 15.0;
-const BRIDGE_SLOPE_SPEED_MULT = 0.85;
 const ALT_COST_RATIO_LIMIT = 1.1;
 const SIGNIFICANT_SHIFT_THRESHOLD = 0.15;
 
@@ -122,22 +120,24 @@ export function computeLineHeadwaySec(
   weatherRailMult: number,
 ): number {
   const spec = TRANSIT_MODES[line.mode];
-  const baseCruiseMps = spec.cruiseSpeedKmh / 3.6;
-  const weatherMult = spec.gradeSeparated ? weatherRailMult : 1 - spec.weatherVulnerability * (1 - weatherBusMult);
-  const dwellSec = INTERMEDIATE_DWELL_SEC * (line.allDoorArc ? 0.5 : 1.0);
+  const dwellSec = INTERMEDIATE_DWELL_SEC * (line.allDoorArc ? ALL_DOOR_ARC_DWELL_MULT : 1.0);
 
   let oneWaySec = 0;
   for (let i = 0; i < line.segments.length; i++) {
     const seg = line.segments[i];
-    const slopeMult = seg.crossingType === 'TRANSIT_BRIDGE' ? BRIDGE_SLOPE_SPEED_MULT : 1.0;
-    const effectiveSpeed = Math.max(1, baseCruiseMps * slopeMult * Math.max(0.2, weatherMult));
+    const effectiveSpeed = computeSegmentEffectiveCruiseMps(
+      line,
+      seg,
+      weatherBusMult,
+      weatherRailMult,
+    );
     oneWaySec += seg.lengthMeters / effectiveSpeed;
     if (i < line.segments.length - 1) {
       oneWaySec += dwellSec;
     }
   }
 
-  const roundTripSec = 2 * oneWaySec + 2 * TERMINUS_TURNAROUND_SEC;
+  const roundTripSec = 2 * oneWaySec + 2 * TERMINUS_TURNAROUND_SEC * (line.allDoorArc ? ALL_DOOR_ARC_DWELL_MULT : 1.0);
   const fleet = Math.max(1, line.vehicleIds.length);
   return Math.max(spec.minSafeHeadwaySec, roundTripSec / fleet);
 }
@@ -318,21 +318,22 @@ export class RouteSegmentPathfinder {
       }
 
       const spec = TRANSIT_MODES[line.mode];
-      const baseCruiseMps = spec.cruiseSpeedKmh / 3.6;
-      const weatherMult = spec.gradeSeparated
-        ? weatherRailMult
-        : 1 - spec.weatherVulnerability * (1 - weatherBusMult);
-      const dwellSec = INTERMEDIATE_DWELL_SEC * (line.allDoorArc ? 0.5 : 1.0);
+      const dwellSec = INTERMEDIATE_DWELL_SEC * (line.allDoorArc ? ALL_DOOR_ARC_DWELL_MULT : 1.0);
       const headwaySec = computeLineHeadwaySec(line, weatherBusMult, weatherRailMult);
       const waitMin = headwaySec / 2 / 60;
+      const lineCap = spec.capacityPerUnit * line.consistCars;
 
-      this.lineCapacityMap.set(line.lineId, spec.capacityPerUnit);
+      this.lineCapacityMap.set(line.lineId, lineCap);
       this.lastBuiltHeadways.set(line.lineId, headwaySec);
 
       const segMinutes: number[] = [];
       for (const seg of line.segments) {
-        const slopeMult = seg.crossingType === 'TRANSIT_BRIDGE' ? BRIDGE_SLOPE_SPEED_MULT : 1.0;
-        const speedMps = Math.max(1, baseCruiseMps * slopeMult * Math.max(0.2, weatherMult));
+        const speedMps = computeSegmentEffectiveCruiseMps(
+          line,
+          seg,
+          weatherBusMult,
+          weatherRailMult,
+        );
         segMinutes.push(seg.lengthMeters / speedMps / 60);
       }
 
@@ -350,7 +351,7 @@ export class RouteSegmentPathfinder {
           this.adjByOrigin[u].push({
             toStationId: stops[j],
             lineId: line.lineId,
-            lineCapacity: spec.capacityPerUnit,
+            lineCapacity: lineCap,
             legCostMin: forwardRideMin + waitMin,
           });
         }
@@ -365,7 +366,7 @@ export class RouteSegmentPathfinder {
           this.adjByOrigin[u].push({
             toStationId: stops[j],
             lineId: line.lineId,
-            lineCapacity: spec.capacityPerUnit,
+            lineCapacity: lineCap,
             legCostMin: reverseRideMin + waitMin,
           });
         }
@@ -422,7 +423,7 @@ export class RouteSegmentPathfinder {
       }
 
       const concourseTier = stationStore.getById(u)?.concourseTier ?? 0;
-      const transferPenaltyMin = CONCOURSE_PENALTY_SEC[concourseTier] / 60;
+      const transferPenaltyMin = CONCOURSE_UPGRADES[concourseTier].transferPenaltySec / 60;
       const edges = this.adjByOrigin[u];
 
       for (let i = 0; i < edges.length; i++) {

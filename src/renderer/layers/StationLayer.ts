@@ -27,15 +27,18 @@ export class StationLayer {
   private readonly markersLayer = new Container();
   private readonly labelsLayer = new Container();
   private readonly badgesLayer = new Container();
+  private readonly selectionRing = new Graphics();
   private readonly hoverRing = new Graphics();
   private visuals: StationNodeVisual[] = [];
   private stationsById = new Map<number, TopologyStation>();
+  private selectedStationId: number | null = null;
 
   constructor() {
     this.container.addChild(this.queueRings);
     this.container.addChild(this.markersLayer);
     this.container.addChild(this.labelsLayer);
     this.container.addChild(this.badgesLayer);
+    this.container.addChild(this.selectionRing);
     this.container.addChild(this.hoverRing);
   }
 
@@ -53,10 +56,21 @@ export class StationLayer {
       const marker = new Graphics();
       const fill = ZONE_COLORS[st.zone];
       const radius = st.seedId ? 9 : 6;
+      if (st.concourseTier >= 2) {
+        marker.circle(0, 0, radius + 5).stroke({ width: 2, color: 0xfbbf24, alpha: 0.9 });
+      } else if (st.concourseTier === 1) {
+        marker.circle(0, 0, radius + 4).stroke({ width: 1.75, color: 0x38bdf8, alpha: 0.8 });
+      }
       marker
         .circle(0, 0, radius)
         .fill({ color: 0x0f172a })
         .stroke({ width: 3, color: fill });
+      if (st.parkAndRideActive) {
+        marker
+          .roundRect(radius + 2, -radius - 4, 9, 9, 2)
+          .fill({ color: 0xf59e0b })
+          .stroke({ width: 1, color: 0x0f172a });
+      }
       marker.position.set(st.x, st.y);
       this.markersLayer.addChild(marker);
 
@@ -98,6 +112,26 @@ export class StationLayer {
         lastWaiting: 0,
       });
     }
+
+    this.drawSelectionRing();
+  }
+
+  setSelectedStation(stationId: number | null): void {
+    this.selectedStationId = stationId;
+    this.drawSelectionRing();
+  }
+
+  private drawSelectionRing(): void {
+    const g = this.selectionRing;
+    g.clear();
+    if (this.selectedStationId === null) {
+      return;
+    }
+    const st = this.stationsById.get(this.selectedStationId);
+    if (!st) {
+      return;
+    }
+    g.circle(st.x, st.y, 19).stroke({ width: 2.5, color: 0xfacc15, alpha: 0.95 });
   }
 
   syncWaitingCounts(stationsRender: StationRenderSoA, count: number): void {

@@ -6,6 +6,9 @@ import type { CityManifest, CityNodeSeed, GeometryPack } from './cities/types';
 import { WorkerClient } from './core/workerClient';
 import { RenderController } from './renderer/RenderController';
 import { MapInteractionController } from './renderer/interaction/MapInteractionController';
+import { LineManagerSidebar } from './ui/components/LineManagerSidebar';
+import { RiverCrossingModal } from './ui/components/RiverCrossingModal';
+import { StationInspectorModal } from './ui/components/StationInspectorModal';
 import { TopTelemetryBar } from './ui/components/TopTelemetryBar';
 import { useGameStore } from './ui/store/useGameStore';
 
@@ -53,21 +56,41 @@ export function App() {
         onCommitBusLine: (waypoints) => {
           useGameStore.getState().commitBusLineWaypoints(waypoints);
         },
-        onDraftChanged: (count) => {
-          useGameStore.getState().setDraftStopCount(count);
+        onEditLineStops: (lineId, waypoints) => {
+          useGameStore.getState().commitEditedLineStops(lineId, waypoints);
+        },
+        onDraftChanged: (count, editingLineId) => {
+          useGameStore.getState().setDraftState(count, editingLineId);
+        },
+        onSelectStation: (stationId) => {
+          useGameStore.getState().setSelectedStationId(stationId);
+        },
+        onRequireRiverCrossing: (info) => {
+          useGameStore.getState().setPendingRiverCrossing(info);
         },
       },
+      edmontonGeometry,
+      edmontonManifest.worldUnitsPerKm,
     );
 
     store.setTransportMode(client.getTransportMode());
     store.setHandlers({
       sendCommand: (cmd) => client.sendCommand(cmd),
       setInteractionTool: (tool) => interaction?.setTool(tool),
+      startEditingLine: (lineId, existingWaypoints) =>
+        interaction?.startEditingLine(lineId, existingWaypoints),
+      undoDraftWaypoint: () => interaction?.undoLastWaypoint(),
       commitDraftLine: () => interaction?.commitDraft(),
       cancelDraftLine: () => interaction?.cancelDraft(),
+      resolveRiverCrossing: (crossingType) => interaction?.resolveRiverCrossing(crossingType),
+      highlightSelectedStation: (stationId) =>
+        renderController.stationLayer.setSelectedStation(stationId),
     });
 
     const onKeyToggle = (e: KeyboardEvent): void => {
+      if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) {
+        return;
+      }
       if (e.key === 'b' || e.key === 'B') {
         const current = useGameStore.getState().activeTool;
         useGameStore.getState().setActiveTool(current === 'PAN' ? 'DRAW_BUS_LINE' : 'PAN');
@@ -103,6 +126,9 @@ export function App() {
     <main className="relative h-screen w-screen overflow-hidden bg-[#0b0f17]">
       <div ref={canvasHostRef} className="h-full w-full cursor-grab active:cursor-grabbing" />
       <TopTelemetryBar />
+      <LineManagerSidebar />
+      <StationInspectorModal />
+      <RiverCrossingModal />
     </main>
   );
 }

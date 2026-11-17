@@ -1,3 +1,4 @@
+import { TRANSIT_MODES } from '../../config/modes';
 import type { SimSpeed } from '../../core/contracts';
 import { useGameStore } from '../store/useGameStore';
 
@@ -12,24 +13,27 @@ export function TopTelemetryBar() {
   const telemetry = useGameStore((s) => s.telemetry);
   const transportMode = useGameStore((s) => s.transportMode);
   const activeTool = useGameStore((s) => s.activeTool);
+  const selectedMode = useGameStore((s) => s.selectedMode);
   const draftStopCount = useGameStore((s) => s.draftStopCount);
-  const selectedLineId = useGameStore((s) => s.selectedLineId);
+  const editingLineId = useGameStore((s) => s.editingLineId);
   const errorMessage = useGameStore((s) => s.errorMessage);
 
   const setSpeed = useGameStore((s) => s.setSpeed);
   const setActiveTool = useGameStore((s) => s.setActiveTool);
-  const setSelectedLineId = useGameStore((s) => s.setSelectedLineId);
   const requestCommitDraft = useGameStore((s) => s.requestCommitDraft);
   const requestCancelDraft = useGameStore((s) => s.requestCancelDraft);
-  const buyBusOnSelectedLine = useGameStore((s) => s.buyBusOnSelectedLine);
+  const setErrorMessage = useGameStore((s) => s.setErrorMessage);
+  const repayBond = useGameStore((s) => s.repayBond);
+
+  const modeSpec = TRANSIT_MODES[selectedMode];
 
   return (
     <>
-      <header className="pointer-events-auto fixed top-3 left-3 right-3 z-20 flex flex-wrap items-center justify-between gap-3 rounded-xl border border-slate-700/70 bg-slate-900/85 px-4 py-2.5 shadow-xl backdrop-blur-md">
+      <header className="pointer-events-auto fixed top-3 right-3 left-3 z-20 flex flex-wrap items-center justify-between gap-3 rounded-xl border border-slate-700/70 bg-slate-900/85 px-4 py-2.5 shadow-xl backdrop-blur-md">
         <div className="flex items-center gap-3">
           <div>
             <div className="text-sm font-semibold tracking-wide text-slate-100">
-              YEG Transit Architect <span className="text-xs font-normal text-sky-400">v0.1</span>
+              YEG Transit Architect <span className="text-xs font-normal text-sky-400">v0.3</span>
             </div>
             <div className="text-xs text-slate-400">
               Edmonton (YEG) &bull; Week {telemetry.simWeek}, Day {telemetry.simDay} &bull;{' '}
@@ -49,13 +53,34 @@ export function TopTelemetryBar() {
           </span>
         </div>
 
-        <div className="flex items-center gap-5 text-xs">
+        <div className="flex flex-wrap items-center gap-5 text-xs">
           <div>
             <div className="text-slate-400">Treasury</div>
             <div className="font-mono text-sm font-semibold text-emerald-300">
               ${telemetry.treasuryCad.toLocaleString('en-CA')} CAD
             </div>
           </div>
+
+          {telemetry.bondDebtCad > 0 && (
+            <div className="flex items-center gap-2 rounded-lg border border-rose-500/40 bg-rose-950/50 px-2.5 py-1">
+              <div>
+                <div className="text-[10px] text-rose-300 uppercase">Bond Overdraft (5%/wk)</div>
+                <div className="font-mono text-xs font-semibold text-rose-200">
+                  -${telemetry.bondDebtCad.toLocaleString('en-CA')} CAD
+                </div>
+              </div>
+              {telemetry.treasuryCad > 0 && (
+                <button
+                  type="button"
+                  onClick={() => repayBond(5_000)}
+                  className="rounded bg-rose-500/30 px-2 py-0.5 font-mono text-[10px] font-semibold text-rose-100 hover:bg-rose-500/50"
+                >
+                  Repay
+                </button>
+              )}
+            </div>
+          )}
+
           <div>
             <div className="text-slate-400">Daily Riders</div>
             <div className="font-mono text-sm font-semibold text-sky-300">
@@ -109,7 +134,7 @@ export function TopTelemetryBar() {
               onClick={() => setActiveTool('DRAW_BUS_LINE')}
               className="rounded-lg bg-sky-500 px-3 py-1.5 text-xs font-semibold text-slate-950 transition hover:bg-sky-400"
             >
-              Draw Bus Line (B)
+              Draw Corridor (B)
             </button>
           ) : (
             <div className="flex items-center gap-1.5">
@@ -119,7 +144,7 @@ export function TopTelemetryBar() {
                 onClick={requestCommitDraft}
                 className="rounded-lg bg-emerald-500 px-3 py-1.5 text-xs font-semibold text-slate-950 transition hover:bg-emerald-400 disabled:cursor-not-allowed disabled:bg-slate-700 disabled:text-slate-400"
               >
-                Finish Line ({draftStopCount})
+                {editingLineId ? 'Save Stops' : 'Finish Line'} ({draftStopCount})
               </button>
               <button
                 type="button"
@@ -130,62 +155,29 @@ export function TopTelemetryBar() {
               </button>
             </div>
           )}
-
-          <button
-            type="button"
-            disabled={telemetry.lines.length === 0}
-            onClick={buyBusOnSelectedLine}
-            className="rounded-lg border border-sky-400/40 bg-sky-500/20 px-3 py-1.5 text-xs font-semibold text-sky-200 transition hover:bg-sky-500/30 disabled:cursor-not-allowed disabled:opacity-40"
-          >
-            +1 Bus ($250)
-          </button>
         </div>
       </header>
 
       {activeTool === 'DRAW_BUS_LINE' && (
         <div className="pointer-events-none fixed top-20 left-1/2 z-20 -translate-x-1/2 rounded-lg border border-sky-500/40 bg-slate-900/90 px-3 py-1.5 text-xs text-sky-200 shadow-lg backdrop-blur">
-          Click 2+ stations or map locations to draw a Local ETS Bus corridor. Double-click or press
-          Enter to finish; Esc or right-click to cancel.
+          {editingLineId ? 'Editing line stops' : `Drawing ${modeSpec.name}`}: click or drag between
+          2+ stations. River crossings open selector. Double-click/Enter to finish; Backspace to undo;
+          Esc to cancel.
         </div>
       )}
 
       {errorMessage && (
-        <div className="pointer-events-none fixed top-20 left-1/2 z-30 -translate-x-1/2 rounded-lg border border-rose-500/50 bg-rose-950/90 px-3 py-1.5 text-xs text-rose-200">
-          {errorMessage}
+        <div className="pointer-events-auto fixed top-20 left-1/2 z-30 flex -translate-x-1/2 items-center gap-2 rounded-lg border border-rose-500/50 bg-rose-950/95 px-3 py-1.5 text-xs text-rose-200 shadow-xl">
+          <span>{errorMessage}</span>
+          <button
+            type="button"
+            onClick={() => setErrorMessage(null)}
+            className="rounded px-1 text-rose-300 hover:bg-rose-900/80 hover:text-white"
+            aria-label="Dismiss error"
+          >
+            &times;
+          </button>
         </div>
-      )}
-
-      {telemetry.lines.length > 0 && (
-        <aside className="pointer-events-auto fixed bottom-3 left-3 z-20 flex max-w-sm flex-col gap-1.5 rounded-xl border border-slate-700/70 bg-slate-900/85 p-3 text-xs shadow-xl backdrop-blur-md">
-          <div className="font-semibold uppercase tracking-wider text-slate-400">Active Routes</div>
-          {telemetry.lines.map((line) => {
-            const isSelected = selectedLineId === line.lineId;
-            return (
-              <button
-                key={line.lineId}
-                type="button"
-                onClick={() => setSelectedLineId(line.lineId)}
-                className={`flex items-center justify-between gap-4 rounded-lg border px-2.5 py-1.5 text-left transition ${
-                  isSelected
-                    ? 'border-sky-400/70 bg-slate-800/90'
-                    : 'border-transparent bg-slate-950/50 hover:bg-slate-800/60'
-                }`}
-              >
-                <span className="flex items-center gap-2 font-medium text-slate-100">
-                  <span
-                    className="inline-block h-2.5 w-2.5 rounded-full"
-                    style={{ backgroundColor: line.color }}
-                  />
-                  {line.name}
-                </span>
-                <span className="font-mono text-slate-300">
-                  {line.stationCount} stops &bull; {line.lengthKm} km &bull; {line.vehicleCount}{' '}
-                  {line.vehicleCount === 1 ? 'bus' : 'buses'}
-                </span>
-              </button>
-            );
-          })}
-        </aside>
       )}
     </>
   );

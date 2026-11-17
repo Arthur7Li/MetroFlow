@@ -50,6 +50,7 @@ export type WorkerCommand =
       events: EventSchedule[];
       growthSeed: GrowthSeedId;
       sharedBuffer?: SharedArrayBuffer;
+      unlimitedBudget?: boolean;
     }
   | { type: 'SET_SPEED'; speed: SimSpeed }
   | {
@@ -65,15 +66,17 @@ export type WorkerCommand =
   | { type: 'UPGRADE_CORRIDOR'; lineId: number; targetMode: TransitModeId }
   | { type: 'BUY_VEHICLE'; lineId: number; count?: number }
   | { type: 'SELL_VEHICLE'; lineId: number; count?: number }
+  | { type: 'SET_CONSIST_CARS'; lineId: number; consistCars: 1 | 2 | 3 | 4 }
   | { type: 'SET_LINE_POLICY'; lineId: number; policy: AutoHeadwayPolicy }
   | { type: 'SET_ALL_DOOR_ARC'; lineId: number; enabled: boolean }
-  | { type: 'UPGRADE_STATION_CONCOURSE'; stationId: number; targetTier: 1 | 2 }
+  | { type: 'UPGRADE_STATION_CONCOURSE'; stationId: number; targetTier: 0 | 1 | 2 }
   | { type: 'SET_CORRIDOR_TSP'; lineId: number; enabled: boolean }
   | { type: 'TOGGLE_PARK_AND_RIDE'; stationId: number; enabled: boolean }
   | { type: 'SET_FEEDER_ZONE'; stationId: number; enabled: boolean; radiusKm?: number }
   | { type: 'STAMP_BLUEPRINT'; blueprintId: string; centerX: number; centerY: number }
   | { type: 'SELECT_COUNCIL_POLICY'; policyId: string }
   | { type: 'SELECT_INSPECTOR_TARGET'; target: InspectorTarget }
+  | { type: 'REPAY_BOND'; amountCad: number }
   | { type: 'EXPORT_SNAPSHOT'; requestId: string }
   | { type: 'IMPORT_SNAPSHOT'; snapshotBytes: Uint8Array }
   | { type: 'RETURN_SNAPSHOT_BUFFER'; buffer: ArrayBuffer };
@@ -87,6 +90,8 @@ export interface TopologyStation {
   zone: ZoneType;
   subTag?: 'ENTERTAINMENT';
   concourseTier: 0 | 1 | 2;
+  parkAndRideActive: boolean;
+  baseProduction: number;
   todLevel: number;
   carryingCapacity: number;
 }
@@ -94,10 +99,14 @@ export interface TopologyStation {
 export interface TopologyLineSegment {
   fromStationId: number;
   toStationId: number;
+  p0x: number;
+  p0y: number;
   cp1x: number;
   cp1y: number;
   cp2x: number;
   cp2y: number;
+  p3x: number;
+  p3y: number;
   crossingType: CrossingType;
   parallelLaneOffset: number;
   lengthMeters: number;
@@ -109,6 +118,7 @@ export interface TopologyLine {
   color: string;
   mode: TransitModeId;
   modeTier: 1 | 2 | 3 | 4 | 5;
+  consistCars: 1 | 2 | 3 | 4;
   vehicleCount: number;
   segments: TopologyLineSegment[];
 }
@@ -132,7 +142,13 @@ export interface TelemetryLineSummary {
   mode: TransitModeId;
   vehicleCount: number;
   stationCount: number;
+  stationIds: number[];
   lengthKm: number;
+  allDoorArc: boolean;
+  tspEnabled: boolean;
+  consistCars: 1 | 2 | 3 | 4;
+  totalCapExCad: number;
+  dailyOpExCad: number;
 }
 
 export interface TelemetrySnapshot {

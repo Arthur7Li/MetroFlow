@@ -24,7 +24,7 @@ const OFF_LINE_ID = 81_920;
 const OFF_MODE_TIER = 90_112;
 const OFF_LOAD_RATIO = 94_208;
 const OFF_ACTIVE_FLAG = 98_304;
-// 4,096 bytes padding from 102,400 to 106,496 maintains 16-byte alignment before StationRenderSoA.
+const OFF_CONSIST_CARS = 102_400; // Uses 4,096B padding region while keeping 16-byte alignment before StationRenderSoA.
 const OFF_WAITING_COUNT = 106_496;
 const OFF_TOD_LEVEL = 108_544;
 const OFF_CONCOURSE_TIER = 109_056;
@@ -41,6 +41,7 @@ export interface VehicleRenderSoA {
   modeTier: Uint8Array;
   loadRatio: Uint8Array;
   activeFlag: Uint8Array;
+  consistCars: Uint8Array;
 }
 
 export interface StationRenderSoA {
@@ -99,6 +100,7 @@ export function createRenderSlotViews(buffer: ArrayBufferLike, slotByteOffset: n
       modeTier: new Uint8Array(buffer, slotByteOffset + OFF_MODE_TIER, MAX_VEHICLES),
       loadRatio: new Uint8Array(buffer, slotByteOffset + OFF_LOAD_RATIO, MAX_VEHICLES),
       activeFlag: new Uint8Array(buffer, slotByteOffset + OFF_ACTIVE_FLAG, MAX_VEHICLES),
+      consistCars: new Uint8Array(buffer, slotByteOffset + OFF_CONSIST_CARS, MAX_VEHICLES),
     },
     stations: {
       waitingCount: new Uint32Array(buffer, slotByteOffset + OFF_WAITING_COUNT, MAX_STATIONS),
