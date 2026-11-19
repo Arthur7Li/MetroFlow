@@ -94,6 +94,7 @@ export class DemandSystem {
   private readonly carCostTable = new Float32Array(MAX_STATIONS * MAX_STATIONS);
   private readonly fractionalCarry = new Float32Array(MAX_STATIONS * MAX_STATIONS);
   private readonly gravityWeights = new Float64Array(MAX_STATIONS);
+  readonly originUnmetCarDaily = new Float32Array(MAX_STATIONS);
 
   private knownStationCount = 0;
   private sliceCursor = 0;
@@ -105,6 +106,7 @@ export class DemandSystem {
   initCity(stationStore: StationStore, worldUnitsPerKm: number): void {
     this.worldUnitsPerKm = worldUnitsPerKm;
     this.fractionalCarry.fill(0);
+    this.originUnmetCarDaily.fill(0);
     this.knownStationCount = 0;
     this.sliceCursor = 0;
     this.dailyTotalTripsT = 0;
@@ -115,6 +117,16 @@ export class DemandSystem {
   resetDailyCounters(): void {
     this.dailyTotalTripsT = 0;
     this.dailyTransitTripsD = 0;
+    this.originUnmetCarDaily.fill(0);
+  }
+
+  getOriginUnmetCarSnapshot(stationCount: number): number[] {
+    const limit = Math.min(stationCount, MAX_STATIONS);
+    const out = new Array<number>(limit);
+    for (let i = 0; i < limit; i++) {
+      out[i] = Math.round(this.originUnmetCarDaily[i]);
+    }
+    return out;
   }
 
   getModeSharePct(): number {
@@ -214,8 +226,7 @@ export class DemandSystem {
     agentStore: AgentStoreSoA,
   ): { totalT: number; transitD: number } {
     const si = stations[origin];
-    const todFactor = 1 + 0.18 * si.todLevel;
-    const production = si.baseProduction * todFactor * diurnal.productionByZone[si.zone] * dayFraction;
+    const production = si.baseProduction * diurnal.productionByZone[si.zone] * dayFraction;
     if (production <= 0) {
       return { totalT: 0, transitD: 0 };
     }
@@ -233,7 +244,7 @@ export class DemandSystem {
         sj.subTag === 'ENTERTAINMENT'
           ? diurnal.entertainmentAttraction
           : diurnal.attractionByZone[sj.zone];
-      const attraction = sj.baseAttraction * (1 + 0.18 * sj.todLevel) * attrMult;
+      const attraction = sj.baseAttraction * attrMult;
 
       const cTransit = pathfinder.getExpectedCost(origin, j);
       const cCar = this.carCostTable[rowBase + j];
@@ -283,6 +294,7 @@ export class DemandSystem {
 
     this.dailyTotalTripsT += originTotalT;
     this.dailyTransitTripsD += originTransitD;
+    this.originUnmetCarDaily[origin] += Math.max(0, originTotalT - originTransitD);
     return { totalT: originTotalT, transitD: originTransitD };
   }
 }

@@ -1,7 +1,9 @@
 import { create } from 'zustand';
 import type { TransitModeId } from '../../cities/types';
 import type {
+  AutoHeadwayPolicy,
   CrossingType,
+  HeatmapLayerMode,
   RouteWaypointInput,
   SimSpeed,
   TelemetrySnapshot,
@@ -49,16 +51,28 @@ const INITIAL_TELEMETRY: TelemetrySnapshot = {
   activeWeather: 'CLEAR',
   activeEvents: [],
   reservePoolCount: 0,
+  reservePoolByMode: {
+    BUS_LOCAL: 0,
+    BRT_ARTICULATED: 0,
+    LRT_LOW_FLOOR: 0,
+    LRT_HIGH_FLOOR: 0,
+    REGIONAL_RAIL: 0,
+  },
   policyDraftPending: false,
   runOutcome: 'ACTIVE',
   activeVehicleCount: 0,
+  stationUnmetCar: [],
   lines: [],
   selectedInspectorData: null,
 };
 
+export type RightDrawerPanel = 'NONE' | 'OCC' | 'BLUEPRINTS';
+
 export interface GameBridgeHandlers {
   sendCommand: (cmd: WorkerCommand) => void;
   setInteractionTool: (tool: InteractionTool) => void;
+  setBlueprintStamp: (blueprintId: string | null) => void;
+  setHeatmapMode: (mode: HeatmapLayerMode) => void;
   startEditingLine: (lineId: number, existingWaypoints: RouteWaypointInput[]) => void;
   undoDraftWaypoint: () => void;
   commitDraftLine: () => void;
@@ -79,6 +93,9 @@ interface GameUiState {
   selectedLineId: number | null;
   selectedStationId: number | null;
   pendingRiverCrossing: PendingRiverCrossingInfo | null;
+  heatmapMode: HeatmapLayerMode;
+  activeRightPanel: RightDrawerPanel;
+  activeBlueprintId: string | null;
   errorMessage: string | null;
   handlers: GameBridgeHandlers | null;
 
@@ -116,7 +133,15 @@ interface GameUiState {
 
   upgradeStationConcourse: (stationId: number, targetTier: 0 | 1 | 2) => void;
   toggleParkAndRide: (stationId: number, enabled: boolean) => void;
+  toggleFeederZone: (stationId: number, enabled: boolean, radiusKm?: number) => void;
   repayBond: (amountCad: number) => void;
+
+  setHeatmapMode: (mode: HeatmapLayerMode) => void;
+  toggleRightPanel: (panel: Exclude<RightDrawerPanel, 'NONE'>) => void;
+  selectBlueprintToStamp: (blueprintId: string | null) => void;
+  commitBlueprintStamp: (blueprintId: string, centerX: number, centerY: number) => void;
+  setLinePolicy: (lineId: number, policy: AutoHeadwayPolicy) => void;
+  recallVehicleToReserve: (lineId: number) => void;
 }
 
 export const useGameStore = create<GameUiState>((set, get) => ({
@@ -131,6 +156,9 @@ export const useGameStore = create<GameUiState>((set, get) => ({
   selectedLineId: null,
   selectedStationId: null,
   pendingRiverCrossing: null,
+  heatmapMode: 'NONE',
+  activeRightPanel: 'NONE',
+  activeBlueprintId: null,
   errorMessage: null,
   handlers: null,
 
@@ -182,9 +210,20 @@ export const useGameStore = create<GameUiState>((set, get) => ({
     handlers?.setInteractionTool(tool);
     if (tool === 'DRAW_BUS_LINE') {
       handlers?.highlightSelectedStation(null);
-      set({ activeTool: tool, selectedStationId: null, errorMessage: null });
+      set({
+        activeTool: tool,
+        selectedStationId: null,
+        activeBlueprintId: null,
+        errorMessage: null,
+      });
     } else {
-      set({ activeTool: tool, pendingRiverCrossing: null, editingLineId: null, draftStopCount: 0 });
+      set({
+        activeTool: tool,
+        pendingRiverCrossing: null,
+        editingLineId: null,
+        draftStopCount: 0,
+        activeBlueprintId: null,
+      });
     }
   },
 
@@ -292,12 +331,14 @@ export const useGameStore = create<GameUiState>((set, get) => ({
 
   requestCancelDraft: () => {
     get().handlers?.cancelDraftLine();
+    get().handlers?.setBlueprintStamp(null);
     get().handlers?.setInteractionTool('PAN');
     set({
       activeTool: 'PAN',
       draftStopCount: 0,
       editingLineId: null,
       pendingRiverCrossing: null,
+      activeBlueprintId: null,
     });
   },
 
@@ -384,8 +425,70 @@ export const useGameStore = create<GameUiState>((set, get) => ({
     get().handlers?.sendCommand({ type: 'TOGGLE_PARK_AND_RIDE', stationId, enabled });
   },
 
+  toggleFeederZone: (stationId, enabled, radiusKm = 2.5) => {
+    set({ errorMessage: null });
+    get().handlers?.sendCommand({ type: 'SET_FEEDER_ZONE', stationId, enabled, radiusKm });
+  },
+
   repayBond: (amountCad) => {
     set({ errorMessage: null });
     get().handlers?.sendCommand({ type: 'REPAY_BOND', amountCad });
+  },
+
+  setHeatmapMode: (heatmapMode) => {
+    get().handlers?.setHeatmapMode(heatmapMode);
+    set({ heatmapMode });
+  },
+
+  toggleRightPanel: (panel) =>
+    set((state) => {
+      const next = state.activeRightPanel === panel ? 'NONE' : panel;
+      if (next !== 'BLUEPRINTS' && state.activeBlueprintId) {
+        state.handlers?.setBlueprintStamp(null);
+        return {
+          activeRightPanel: next,
+          activeBlueprintId: null,
+          activeTool: 'PAN',
+        };
+      }
+      return { activeRightPanel: next };
+    }),
+
+  selectBlueprintToStamp: (blueprintId) => {
+    const handlers = get().handlers;
+    handlers?.highlightSelectedStation(null);
+    handlers?.setBlueprintStamp(blueprintId);
+    set({
+      activeBlueprintId: blueprintId,
+      activeTool: blueprintId ? 'STAMP_BLUEPRINT' : 'PAN',
+      selectedStationId: null,
+      errorMessage: null,
+    });
+  },
+
+  commitBlueprintStamp: (blueprintId, centerX, centerY) => {
+    const state = get();
+    state.handlers?.sendCommand({
+      type: 'STAMP_BLUEPRINT',
+      blueprintId,
+      centerX,
+      centerY,
+    });
+    state.handlers?.setBlueprintStamp(null);
+    set({
+      activeBlueprintId: null,
+      activeTool: 'PAN',
+      errorMessage: null,
+    });
+  },
+
+  setLinePolicy: (lineId, policy) => {
+    set({ errorMessage: null });
+    get().handlers?.sendCommand({ type: 'SET_LINE_POLICY', lineId, policy });
+  },
+
+  recallVehicleToReserve: (lineId) => {
+    set({ errorMessage: null });
+    get().handlers?.sendCommand({ type: 'RECALL_VEHICLE_TO_RESERVE', lineId, count: 1 });
   },
 }));

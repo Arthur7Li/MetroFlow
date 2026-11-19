@@ -2,6 +2,7 @@ import { TRANSIT_MODES } from '../../config/modes';
 import { ALL_DOOR_ARC_DWELL_MULT, CONCOURSE_UPGRADES } from '../../config/upgrades';
 import { MAX_STATIONS, UNREACHABLE_ID } from '../contracts';
 import {
+  computeLineRoundTripSec,
   computeSegmentEffectiveCruiseMps,
   type TransitLineRecord,
   type TransitLineStore,
@@ -9,7 +10,6 @@ import {
 import type { StationStore } from '../stores/stations';
 
 const INTERMEDIATE_DWELL_SEC = 3.0;
-const TERMINUS_TURNAROUND_SEC = 15.0;
 const ALT_COST_RATIO_LIMIT = 1.1;
 const SIGNIFICANT_SHIFT_THRESHOLD = 0.15;
 
@@ -120,24 +120,7 @@ export function computeLineHeadwaySec(
   weatherRailMult: number,
 ): number {
   const spec = TRANSIT_MODES[line.mode];
-  const dwellSec = INTERMEDIATE_DWELL_SEC * (line.allDoorArc ? ALL_DOOR_ARC_DWELL_MULT : 1.0);
-
-  let oneWaySec = 0;
-  for (let i = 0; i < line.segments.length; i++) {
-    const seg = line.segments[i];
-    const effectiveSpeed = computeSegmentEffectiveCruiseMps(
-      line,
-      seg,
-      weatherBusMult,
-      weatherRailMult,
-    );
-    oneWaySec += seg.lengthMeters / effectiveSpeed;
-    if (i < line.segments.length - 1) {
-      oneWaySec += dwellSec;
-    }
-  }
-
-  const roundTripSec = 2 * oneWaySec + 2 * TERMINUS_TURNAROUND_SEC * (line.allDoorArc ? ALL_DOOR_ARC_DWELL_MULT : 1.0);
+  const roundTripSec = computeLineRoundTripSec(line, weatherBusMult, weatherRailMult);
   const fleet = Math.max(1, line.vehicleIds.length);
   return Math.max(spec.minSafeHeadwaySec, roundTripSec / fleet);
 }

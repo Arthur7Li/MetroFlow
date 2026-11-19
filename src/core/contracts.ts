@@ -20,6 +20,8 @@ export const SIM_SECONDS_PER_REAL_SECOND = 120;
 
 export type SimSpeed = 0 | 1 | 2 | 4;
 export type CrossingType = 'NONE' | 'ROAD_BRIDGE' | 'TRANSIT_BRIDGE' | 'TUNNEL';
+export type HeatmapLayerMode = 'NONE' | 'CROWDING' | 'LAND_VALUE' | 'HEADWAYS' | 'UNMET_CAR';
+export type GovernorState = 'OK' | 'SAFE_HEADWAY' | 'OPEX_CAP';
 export type GrowthSeedId = 'SEED_A' | 'SEED_B' | 'SEED_C';
 export type RunOutcome = 'ACTIVE' | 'VICTORY' | 'BANKRUPT' | 'ZERO_APPROVAL';
 export type TransportMode = 'SAB' | 'TRANSFERABLE';
@@ -66,6 +68,7 @@ export type WorkerCommand =
   | { type: 'UPGRADE_CORRIDOR'; lineId: number; targetMode: TransitModeId }
   | { type: 'BUY_VEHICLE'; lineId: number; count?: number }
   | { type: 'SELL_VEHICLE'; lineId: number; count?: number }
+  | { type: 'RECALL_VEHICLE_TO_RESERVE'; lineId: number; count?: number }
   | { type: 'SET_CONSIST_CARS'; lineId: number; consistCars: 1 | 2 | 3 | 4 }
   | { type: 'SET_LINE_POLICY'; lineId: number; policy: AutoHeadwayPolicy }
   | { type: 'SET_ALL_DOOR_ARC'; lineId: number; enabled: boolean }
@@ -91,8 +94,12 @@ export interface TopologyStation {
   subTag?: 'ENTERTAINMENT';
   concourseTier: 0 | 1 | 2;
   parkAndRideActive: boolean;
+  feederActive: boolean;
+  feederRadiusKm: number;
   baseProduction: number;
+  weeklyBoardings: number;
   todLevel: number;
+  todWeight: number;
   carryingCapacity: number;
 }
 
@@ -149,6 +156,12 @@ export interface TelemetryLineSummary {
   consistCars: 1 | 2 | 3 | 4;
   totalCapExCad: number;
   dailyOpExCad: number;
+  policy: AutoHeadwayPolicy;
+  actualHeadwaySec: number;
+  targetHeadwaySec: number;
+  governorState: GovernorState;
+  upgradeRecommended: boolean;
+  avgLoadPct: number;
 }
 
 export interface TelemetrySnapshot {
@@ -171,9 +184,11 @@ export interface TelemetrySnapshot {
   activeWeather: string;
   activeEvents: string[];
   reservePoolCount: number;
+  reservePoolByMode: Record<TransitModeId, number>;
   policyDraftPending: boolean;
   runOutcome: RunOutcome;
   activeVehicleCount: number;
+  stationUnmetCar: number[];
   lines: TelemetryLineSummary[];
   selectedInspectorData: unknown;
 }

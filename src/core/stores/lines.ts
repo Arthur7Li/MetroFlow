@@ -1,6 +1,7 @@
-import type { TransitModeId } from '../../cities/types';
+import type { GeometryPack, TransitModeId } from '../../cities/types';
 import { TRANSIT_MODES } from '../../config/modes';
 import {
+  ALL_DOOR_ARC_DWELL_MULT,
   RIVER_CROSSING_SPECS,
   TRAM_NO_TSP_SPEED_MULT,
   isModeAllowedOnCrossing,
@@ -84,6 +85,148 @@ export function computeSegmentEffectiveCruiseMps(
       ? weatherRailMult
       : 1 - spec.weatherVulnerability * (1 - weatherBusMult);
   return Math.max(1, speedMps * Math.max(0.2, weatherMult));
+}
+
+export type PolygonRing = Array<[number, number]>;
+
+export function extractRiverRings(geometry?: GeometryPack): PolygonRing[] {
+  if (!geometry) {
+    return [];
+  }
+  const rings: PolygonRing[] = [];
+  for (const feat of geometry.features) {
+    const isRiver =
+      feat.properties.kind === 'RIVER' || feat.properties.id === 'north_saskatchewan_river';
+    if (!isRiver || feat.geometry.type !== 'Polygon') {
+      continue;
+    }
+    const coords = feat.geometry.coordinates as number[][][];
+    for (const ring of coords) {
+      if (ring.length >= 3) {
+        rings.push(ring.map((pt) => [pt[0], pt[1]] as [number, number]));
+      }
+    }
+  }
+  return rings;
+}
+
+function orientation2D(
+  ax: number,
+  ay: number,
+  bx: number,
+  by: number,
+  cx: number,
+  cy: number,
+): number {
+  const val = (by - ay) * (cx - bx) - (bx - ax) * (cy - by);
+  if (Math.abs(val) < 1e-6) {
+    return 0;
+  }
+  return val > 0 ? 1 : 2;
+}
+
+function onSegment2D(
+  ax: number,
+  ay: number,
+  bx: number,
+  by: number,
+  px: number,
+  py: number,
+): boolean {
+  return (
+    px <= Math.max(ax, bx) + 1e-6 &&
+    px >= Math.min(ax, bx) - 1e-6 &&
+    py <= Math.max(ay, by) + 1e-6 &&
+    py >= Math.min(ay, by) - 1e-6
+  );
+}
+
+function segmentsIntersect2D(
+  a1x: number,
+  a1y: number,
+  a2x: number,
+  a2y: number,
+  b1x: number,
+  b1y: number,
+  b2x: number,
+  b2y: number,
+): boolean {
+  const o1 = orientation2D(a1x, a1y, a2x, a2y, b1x, b1y);
+  const o2 = orientation2D(a1x, a1y, a2x, a2y, b2x, b2y);
+  const o3 = orientation2D(b1x, b1y, b2x, b2y, a1x, a1y);
+  const o4 = orientation2D(b1x, b1y, b2x, b2y, a2x, a2y);
+
+  if (o1 !== o2 && o3 !== o4) {
+    return true;
+  }
+  if (o1 === 0 && onSegment2D(a1x, a1y, a2x, a2y, b1x, b1y)) return true;
+  if (o2 === 0 && onSegment2D(a1x, a1y, a2x, a2y, b2x, b2y)) return true;
+  if (o3 === 0 && onSegment2D(b1x, b1y, b2x, b2y, a1x, a1y)) return true;
+  if (o4 === 0 && onSegment2D(b1x, b1y, b2x, b2y, a2x, a2y)) return true;
+  return false;
+}
+
+function pointInPolygonRing(px: number, py: number, ring: PolygonRing): boolean {
+  let inside = false;
+  for (let i = 0, j = ring.length - 1; i < ring.length; j = i++) {
+    const xi = ring[i][0];
+    const yi = ring[i][1];
+    const xj = ring[j][0];
+    const yj = ring[j][1];
+    const intersect = yi > py !== yj > py && px < ((xj - xi) * (py - yi)) / (yj - yi + 1e-9) + xi;
+    if (intersect) {
+      inside = !inside;
+    }
+  }
+  return inside;
+}
+
+export function segmentIntersectsRiverRings(
+  ax: number,
+  ay: number,
+  bx: number,
+  by: number,
+  rings: readonly PolygonRing[],
+): boolean {
+  const midX = (ax + bx) * 0.5;
+  const midY = (ay + by) * 0.5;
+  for (const ring of rings) {
+    if (pointInPolygonRing(midX, midY, ring)) {
+      return true;
+    }
+    for (let i = 0; i < ring.length; i++) {
+      const [rx1, ry1] = ring[i];
+      const [rx2, ry2] = ring[(i + 1) % ring.length];
+      if (segmentsIntersect2D(ax, ay, bx, by, rx1, ry1, rx2, ry2)) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+export function computeLineRoundTripSec(
+  line: Pick<TransitLineRecord, 'mode' | 'tspEnabled' | 'allDoorArc' | 'segments'>,
+  weatherBusMult = 1.0,
+  weatherRailMult = 1.0,
+): number {
+  const dwellMult = line.allDoorArc ? ALL_DOOR_ARC_DWELL_MULT : 1.0;
+  const dwellSec = 3.0 * dwellMult;
+  let oneWaySec = 0;
+  for (let i = 0; i < line.segments.length; i++) {
+    const seg = line.segments[i];
+    const effectiveSpeed = computeSegmentEffectiveCruiseMps(
+      line,
+      seg,
+      weatherBusMult,
+      weatherRailMult,
+    );
+    oneWaySec += seg.lengthMeters / effectiveSpeed;
+    if (i < line.segments.length - 1) {
+      oneWaySec += dwellSec;
+    }
+  }
+  return 2 * oneWaySec + 2 * 15.0 * dwellMult;
 }
 
 function evalCubic(p0: number, c1: number, c2: number, p3: number, t: number): number {

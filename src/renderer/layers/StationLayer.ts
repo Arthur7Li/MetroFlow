@@ -1,6 +1,10 @@
 import { Container, Graphics, Text } from 'pixi.js';
 import type { ZoneType } from '../../cities/types';
-import type { TopologyStation } from '../../core/contracts';
+import type {
+  HeatmapLayerMode,
+  TopologyFeederZone,
+  TopologyStation,
+} from '../../core/contracts';
 import type { StationRenderSoA } from '../../core/memory/sharedBuffers';
 
 const ZONE_COLORS: Record<ZoneType, number> = {
@@ -19,10 +23,13 @@ interface StationNodeVisual {
   label: Text;
   queueBadge: Text;
   lastWaiting: number;
+  lastTodLevel: number;
 }
 
 export class StationLayer {
   readonly container = new Container();
+  private readonly feederLayer = new Graphics();
+  private readonly heatmapLayer = new Graphics();
   private readonly queueRings = new Graphics();
   private readonly markersLayer = new Container();
   private readonly labelsLayer = new Container();
@@ -32,8 +39,12 @@ export class StationLayer {
   private visuals: StationNodeVisual[] = [];
   private stationsById = new Map<number, TopologyStation>();
   private selectedStationId: number | null = null;
+  private heatmapMode: HeatmapLayerMode = 'NONE';
+  private unmetCarByStation: number[] = [];
 
   constructor() {
+    this.container.addChild(this.feederLayer);
+    this.container.addChild(this.heatmapLayer);
     this.container.addChild(this.queueRings);
     this.container.addChild(this.markersLayer);
     this.container.addChild(this.labelsLayer);
@@ -42,7 +53,8 @@ export class StationLayer {
     this.container.addChild(this.hoverRing);
   }
 
-  updateTopology(stations: TopologyStation[]): void {
+  updateTopology(stations: TopologyStation[], feederZones: TopologyFeederZone[] = []): void {
+    this.feederLayer.clear();
     this.queueRings.clear();
     this.markersLayer.removeChildren();
     this.labelsLayer.removeChildren();
@@ -69,6 +81,12 @@ export class StationLayer {
         marker
           .roundRect(radius + 2, -radius - 4, 9, 9, 2)
           .fill({ color: 0xf59e0b })
+          .stroke({ width: 1, color: 0x0f172a });
+      }
+      if (st.feederActive) {
+        marker
+          .circle(-radius - 5, -radius - 1, 4)
+          .fill({ color: 0x22d3ee })
           .stroke({ width: 1, color: 0x0f172a });
       }
       marker.position.set(st.x, st.y);
@@ -110,10 +128,77 @@ export class StationLayer {
         label,
         queueBadge,
         lastWaiting: 0,
+        lastTodLevel: st.todLevel,
       });
     }
 
+    for (const zone of feederZones) {
+      const hub = this.stationsById.get(zone.stationId);
+      if (!hub) {
+        continue;
+      }
+      this.feederLayer
+        .circle(hub.x, hub.y, zone.radiusWorldUnits)
+        .fill({ color: 0x06b6d4, alpha: 0.08 })
+        .stroke({ width: 2, color: 0x22d3ee, alpha: 0.5 });
+    }
+
     this.drawSelectionRing();
+    this.drawHeatmapLayer();
+  }
+
+  setHeatmapState(mode: HeatmapLayerMode, unmetCarByStation?: number[]): void {
+    this.heatmapMode = mode;
+    if (unmetCarByStation) {
+      this.unmetCarByStation = unmetCarByStation;
+    }
+    this.drawHeatmapLayer();
+  }
+
+  private drawHeatmapLayer(): void {
+    const g = this.heatmapLayer;
+    g.clear();
+    if (
+      this.heatmapMode === 'NONE' ||
+      this.heatmapMode === 'HEADWAYS' ||
+      this.visuals.length === 0
+    ) {
+      return;
+    }
+
+    let maxUnmet = 200;
+    if (this.heatmapMode === 'UNMET_CAR') {
+      for (let i = 0; i < this.visuals.length; i++) {
+        const val = this.unmetCarByStation[i] ?? 0;
+        if (val > maxUnmet) {
+          maxUnmet = val;
+        }
+      }
+    }
+
+    for (let i = 0; i < this.visuals.length; i++) {
+      const vis = this.visuals[i];
+      let norm = 0;
+      let color = 0x38bdf8;
+
+      if (this.heatmapMode === 'CROWDING') {
+        norm = Math.min(1, vis.lastWaiting / 200);
+        color = norm >= 0.7 ? 0xef4444 : norm >= 0.35 ? 0xf59e0b : 0x38bdf8;
+      } else if (this.heatmapMode === 'LAND_VALUE') {
+        norm = Math.min(1, vis.lastTodLevel / 5);
+        color = norm >= 0.6 ? 0xfacc15 : 0x10b981;
+      } else if (this.heatmapMode === 'UNMET_CAR') {
+        const raw = this.unmetCarByStation[i] ?? 0;
+        norm = Math.min(1, raw / maxUnmet);
+        color = norm >= 0.6 ? 0xf43f5e : 0xfb7185;
+      }
+
+      if (norm <= 0.02) {
+        continue;
+      }
+      const glowRadius = 24 + norm * 48;
+      g.circle(vis.x, vis.y, glowRadius).fill({ color, alpha: 0.14 + norm * 0.28 });
+    }
   }
 
   setSelectedStation(stationId: number | null): void {
@@ -137,10 +222,16 @@ export class StationLayer {
   syncWaitingCounts(stationsRender: StationRenderSoA, count: number): void {
     const limit = Math.min(count, this.visuals.length);
     let dirtyRings = false;
+    let dirtyTod = false;
 
     for (let i = 0; i < limit; i++) {
       const vis = this.visuals[i];
       const waiting = stationsRender.waitingCount[i];
+      const tod = stationsRender.todLevel[i];
+      if (tod !== vis.lastTodLevel) {
+        vis.lastTodLevel = tod;
+        dirtyTod = true;
+      }
       if (waiting !== vis.lastWaiting) {
         vis.lastWaiting = waiting;
         dirtyRings = true;
@@ -166,6 +257,13 @@ export class StationLayer {
         const haloColor = vis.lastWaiting >= 100 ? 0xf59e0b : 0x38bdf8;
         g.circle(vis.x, vis.y, haloRadius).stroke({ width: 2, color: haloColor, alpha: 0.45 });
       }
+    }
+
+    if (
+      (dirtyRings && this.heatmapMode === 'CROWDING') ||
+      (dirtyTod && this.heatmapMode === 'LAND_VALUE')
+    ) {
+      this.drawHeatmapLayer();
     }
   }
 

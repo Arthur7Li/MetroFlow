@@ -3,10 +3,12 @@ import { TRANSIT_MODES } from '../config/modes';
 import {
   ALL_DOOR_ARC_CAPEX_CAD,
   CAPEX_TEARDOWN_REFUND_RATIO,
+  FEEDER_AI_DEFAULT_RADIUS_KM,
   LRV_EXTRA_CAR_CAPEX_CAD,
   MAX_LRV_CONSIST_CARS,
   MAX_SCENIC_APPROVAL_BONUS_PCT,
   TSP_CAPEX_PER_KM_CAD,
+  getBlueprintById,
   supportsMultiCarConsist,
 } from '../config/upgrades';
 import {
@@ -14,6 +16,7 @@ import {
   UNREACHABLE_ID,
   WORKER_FIXED_DT_REAL_SEC,
   type InspectorTarget,
+  type RouteWaypointInput,
   type SimSpeed,
   type TelemetrySnapshot,
   type TopologySnapshot,
@@ -28,11 +31,19 @@ import {
 } from './memory/sharedBuffers';
 import { RouteSegmentPathfinder } from './routing/pathfinder';
 import { AgentStoreSoA } from './stores/agents';
-import { TransitLineStore, type TransitLineRecord } from './stores/lines';
+import {
+  TransitLineStore,
+  extractRiverRings,
+  segmentIntersectsRiverRings,
+  type PolygonRing,
+  type TransitLineRecord,
+} from './stores/lines';
 import { StationStore } from './stores/stations';
 import { VehicleStoreSoA } from './stores/vehicles';
 import { DemandSystem } from './systems/demandSystem';
+import { DispatchSystem } from './systems/dispatchSystem';
 import { EconomySystem } from './systems/economySystem';
+import { TodSystem } from './systems/todSystem';
 
 const INITIAL_HOUR_SECONDS = 6 * 3600 + 30 * 60; // Start campaign day at 06:30 Morning Peak.
 const PATIENCE_CEILING_MIN = 12.0;
@@ -49,6 +60,9 @@ export class WorkerSimulationEngine {
   readonly pathfinder = new RouteSegmentPathfinder();
   readonly demand = new DemandSystem();
   readonly economy = new EconomySystem();
+  readonly dispatch = new DispatchSystem();
+  readonly tod = new TodSystem();
+  private riverRings: PolygonRing[] = [];
 
   private sabWriter: SharedSnapshotWriter | null = null;
   private transferableWriter: TransferableSnapshotWriter | null = null;
@@ -118,11 +132,13 @@ export class WorkerSimulationEngine {
     switch (cmd.type) {
       case 'INIT_CITY': {
         this.manifest = cmd.manifest;
+        this.riverRings = extractRiverRings(cmd.geometry);
         this.stations.initFromSeeds(cmd.nodes);
         this.lines.reset();
         this.vehicles.reset();
         this.agents.reset();
         this.economy.reset(Boolean(cmd.unlimitedBudget));
+        this.dispatch.reset();
         this.demand.initCity(this.stations, cmd.manifest.worldUnitsPerKm);
         this.simTimeSeconds = INITIAL_HOUR_SECONDS;
         this.tickIndex = 0;
@@ -236,6 +252,7 @@ export class WorkerSimulationEngine {
         }
         this.vehicles.removeAllVehiclesForLine(line);
         this.economy.refundCapEx(line.investedCapExCad);
+        this.dispatch.clearLineState(cmd.lineId);
         this.lines.deleteLine(cmd.lineId, this.stations, this.manifest.worldUnitsPerKm);
 
         this.pathfinder.scheduleRebuild(this.stations, this.lines, 1.0, 1.0);
@@ -350,40 +367,85 @@ export class WorkerSimulationEngine {
         const perVehicleCapEx =
           spec.vehicleCapEx + Math.max(0, line.consistCars - 1) * LRV_EXTRA_CAR_CAPEX_CAD;
 
-        if (!this.economy.canAfford(count * perVehicleCapEx)) {
+        const reserveCount = this.dispatch.getReservePoolSnapshot()[line.mode];
+        const paidNeeded = Math.max(0, count - reserveCount);
+        if (paidNeeded > 0 && !this.economy.canAfford(paidNeeded * perVehicleCapEx)) {
           this.postOutbound({
             type: 'ERROR',
-            message: `Insufficient funds for ${count}x ${spec.name} unit ($${(count * perVehicleCapEx).toLocaleString('en-CA')} CAD).`,
+            message: `Insufficient funds for ${paidNeeded}x ${spec.name} unit ($${(paidNeeded * perVehicleCapEx).toLocaleString('en-CA')} CAD).`,
           });
           return;
         }
 
         const spawnedIds: number[] = [];
         for (let i = 0; i < count; i++) {
-          const vId = this.vehicles.spawnVehicle(line);
+          const fromReserve = this.dispatch.tryPopReserveVehicle(line.mode);
+          const vId = this.spawnVehicleWithStopCheck(line, fromReserve);
           if (vId !== -1) {
+            if (!fromReserve) {
+              this.economy.spendCapEx(perVehicleCapEx);
+              line.investedCapExCad += perVehicleCapEx;
+            }
             spawnedIds.push(vId);
+          } else if (fromReserve) {
+            this.dispatch.addToReserve(line.mode, 1);
           }
         }
         if (spawnedIds.length > 0) {
-          const totalSpend = spawnedIds.length * perVehicleCapEx;
-          this.economy.spendCapEx(totalSpend);
-          line.investedCapExCad += totalSpend;
-
           if (this.pathfinder.checkSignificantShift(this.lines, 1.0, 1.0)) {
             this.pathfinder.scheduleRebuild(this.stations, this.lines, 1.0, 1.0, line.stationIds);
-          }
-          for (const vId of spawnedIds) {
-            const segIdx = this.vehicles.segmentIdx[vId];
-            const seg = line.segments[segIdx];
-            const startStationId =
-              this.vehicles.direction[vId] >= 0 ? seg.fromStationId : seg.toStationId;
-            this.processStationStop(vId, startStationId, line);
           }
           this.publishSnapshot(0);
           this.emitTopology();
           this.emitTelemetry();
         }
+        break;
+      }
+
+      case 'RECALL_VEHICLE_TO_RESERVE': {
+        const line = this.lines.getById(cmd.lineId);
+        if (!line || line.vehicleIds.length <= 1) {
+          return;
+        }
+        const count = Math.max(1, Math.min(line.vehicleIds.length - 1, cmd.count ?? 1));
+        let recalled = 0;
+        for (let i = 0; i < count; i++) {
+          if (this.recallLineVehicleToReserve(line)) {
+            recalled += 1;
+          }
+        }
+        if (recalled > 0) {
+          if (this.pathfinder.checkSignificantShift(this.lines, 1.0, 1.0)) {
+            this.pathfinder.scheduleRebuild(this.stations, this.lines, 1.0, 1.0, line.stationIds);
+          }
+          this.publishSnapshot(0);
+          this.emitTopology();
+          this.emitTelemetry();
+        }
+        break;
+      }
+
+      case 'SET_LINE_POLICY': {
+        const line = this.lines.getById(cmd.lineId);
+        if (!line) {
+          return;
+        }
+        line.policy = cmd.policy;
+        const evalRes = this.dispatch.evaluateLine(
+          line,
+          this.stations,
+          this.vehicles,
+          this.economy,
+          (l, fromReserve) => this.spawnVehicleWithStopCheck(l, fromReserve),
+          (l) => this.recallLineVehicleToReserve(l),
+        );
+        if (evalRes.changed) {
+          this.pathfinder.scheduleRebuild(this.stations, this.lines, 1.0, 1.0, line.stationIds);
+          this.pathfinder.stepRebuild(this.stations, 32);
+          this.publishSnapshot(0);
+          this.emitTopology();
+        }
+        this.emitTelemetry();
         break;
       }
 
@@ -570,6 +632,133 @@ export class WorkerSimulationEngine {
         break;
       }
 
+      case 'SET_FEEDER_ZONE': {
+        if (!this.manifest) {
+          return;
+        }
+        const costInfo = this.stations.getFeederTransitionCost(cmd.stationId, cmd.enabled);
+        if (!costInfo) {
+          return;
+        }
+        if (costInfo.capExCostCad > 0) {
+          const spend = this.economy.spendCapEx(costInfo.capExCostCad);
+          if (!spend.ok) {
+            this.postOutbound({ type: 'ERROR', message: spend.error });
+            return;
+          }
+        } else if (costInfo.refundOriginalCad > 0) {
+          this.economy.refundCapEx(costInfo.refundOriginalCad);
+        }
+
+        this.stations.setFeederZone(
+          cmd.stationId,
+          cmd.enabled,
+          cmd.radiusKm ?? FEEDER_AI_DEFAULT_RADIUS_KM,
+        );
+        this.dispatch.recomputeFeederCatchments(this.stations, this.manifest.worldUnitsPerKm);
+        this.demand.syncStationMatrix(this.stations);
+        this.publishSnapshot(0);
+        this.emitTopology();
+        this.emitTelemetry();
+        break;
+      }
+
+      case 'STAMP_BLUEPRINT': {
+        if (!this.manifest) {
+          return;
+        }
+        const bp = getBlueprintById(cmd.blueprintId);
+        if (!bp) {
+          this.postOutbound({ type: 'ERROR', message: `Unknown blueprint "${cmd.blueprintId}"` });
+          return;
+        }
+        const spend = this.economy.spendCapEx(bp.capExCad);
+        if (!spend.ok) {
+          this.postOutbound({ type: 'ERROR', message: spend.error });
+          return;
+        }
+
+        const bounds = this.manifest.worldBounds;
+        const clampX = (x: number): number => Math.round(Math.max(60, Math.min(bounds.width - 60, x)));
+        const clampY = (y: number): number => Math.round(Math.max(60, Math.min(bounds.height - 60, y)));
+
+        const resolvedNodes = new Map<string, { stationId: number; x: number; y: number }>();
+        for (const nodeOffset of bp.nodes) {
+          const st = this.stations.resolveOrCreateStation(
+            clampX(cmd.centerX + nodeOffset.dx),
+            clampY(cmd.centerY + nodeOffset.dy),
+          );
+          if (!st) {
+            this.economy.refundCapEx(bp.capExCad / CAPEX_TEARDOWN_REFUND_RATIO);
+            this.postOutbound({ type: 'ERROR', message: 'Maximum station capacity reached.' });
+            return;
+          }
+          resolvedNodes.set(nodeOffset.key, { stationId: st.stationId, x: st.x, y: st.y });
+        }
+
+        const hubNode = resolvedNodes.get('center');
+        if (hubNode) {
+          const hubStation = this.stations.getById(hubNode.stationId);
+          if (hubStation && hubStation.concourseTier < bp.hubConcourseTier) {
+            this.stations.setConcourseTier(hubNode.stationId, bp.hubConcourseTier);
+          }
+          if (hubStation && bp.enableFeederAi) {
+            this.stations.setFeederZone(
+              hubNode.stationId,
+              true,
+              bp.feederRadiusKm ?? FEEDER_AI_DEFAULT_RADIUS_KM,
+            );
+          }
+        }
+
+        const affectedStations: number[] = [];
+        for (let i = 0; i < bp.corridors.length; i++) {
+          const spec = bp.corridors[i];
+          const waypoints: RouteWaypointInput[] = [];
+          for (let k = 0; k < spec.nodeKeys.length; k++) {
+            const pt = resolvedNodes.get(spec.nodeKeys[k]);
+            if (!pt) {
+              continue;
+            }
+            const prevPt = waypoints[waypoints.length - 1];
+            const crossing =
+              prevPt && segmentIntersectsRiverRings(prevPt.x, prevPt.y, pt.x, pt.y, this.riverRings)
+                ? 'TRANSIT_BRIDGE'
+                : 'NONE';
+            waypoints.push({ stationId: pt.stationId, x: pt.x, y: pt.y, crossingType: crossing });
+          }
+          const created = this.lines.createLine(
+            spec.nameSuffix,
+            spec.color,
+            spec.mode,
+            waypoints,
+            this.stations,
+            this.manifest.worldUnitsPerKm,
+          );
+          if ('error' in created) {
+            continue;
+          }
+          if (spec.allDoorArc) {
+            created.line.allDoorArc = true;
+          }
+          created.line.investedCapExCad = Math.round(bp.capExCad / bp.corridors.length);
+          for (let v = 0; v < spec.initialVehicles; v++) {
+            this.spawnVehicleWithStopCheck(created.line, false);
+          }
+          affectedStations.push(...created.line.stationIds);
+        }
+
+        this.dispatch.recomputeFeederCatchments(this.stations, this.manifest.worldUnitsPerKm);
+        this.demand.syncStationMatrix(this.stations);
+        this.pathfinder.scheduleRebuild(this.stations, this.lines, 1.0, 1.0, affectedStations);
+        this.pathfinder.stepRebuild(this.stations, 32);
+        this.recomputePublicApproval();
+        this.publishSnapshot(0);
+        this.emitTopology();
+        this.emitTelemetry();
+        break;
+      }
+
       case 'SELECT_INSPECTOR_TARGET':
         this.inspectorTarget = cmd.target;
         this.emitTelemetry();
@@ -587,6 +776,44 @@ export class WorkerSimulationEngine {
       default:
         break;
     }
+  }
+
+  private spawnVehicleWithStopCheck(line: TransitLineRecord, fromReserve: boolean): number {
+    const vId = this.vehicles.spawnVehicle(line);
+    if (vId === -1) {
+      return -1;
+    }
+    if (fromReserve) {
+      const spec = TRANSIT_MODES[line.mode];
+      const perVehCapEx =
+        spec.vehicleCapEx + Math.max(0, line.consistCars - 1) * LRV_EXTRA_CAR_CAPEX_CAD;
+      line.investedCapExCad += perVehCapEx;
+    }
+    const segIdx = this.vehicles.segmentIdx[vId];
+    const seg = line.segments[segIdx];
+    if (seg) {
+      const startStationId =
+        this.vehicles.direction[vId] >= 0 ? seg.fromStationId : seg.toStationId;
+      this.processStationStop(vId, startStationId, line);
+    }
+    return vId;
+  }
+
+  private recallLineVehicleToReserve(line: TransitLineRecord): boolean {
+    if (line.vehicleIds.length <= 1) {
+      return false;
+    }
+    const vId = this.vehicles.sellLastVehicle(line);
+    if (vId === -1) {
+      return false;
+    }
+    this.evacuateVehiclePassengers(vId, line);
+    const spec = TRANSIT_MODES[line.mode];
+    const perVehCapEx =
+      spec.vehicleCapEx + Math.max(0, line.consistCars - 1) * LRV_EXTRA_CAR_CAPEX_CAD;
+    line.investedCapExCad = Math.max(0, line.investedCapExCad - perVehCapEx);
+    this.dispatch.addToReserve(line.mode, 1);
+    return true;
   }
 
   private evacuateVehiclePassengers(vehicleId: number, line: TransitLineRecord): void {
@@ -656,16 +883,39 @@ export class WorkerSimulationEngine {
       overrideDtSimSeconds ?? WORKER_FIXED_DT_REAL_SEC * SIM_SECONDS_PER_REAL_SECOND * this.speed;
 
     this.simTimeSeconds += dtSimSeconds;
+    const dailyTodTaxCad = this.tod.computeDailyTodTaxCad(this.stations.stations);
     const rollover = this.economy.stepDayAndWeekRollover(
       this.simTimeSeconds,
       this.lines.lines,
       this.stations.stations,
+      dailyTodTaxCad,
     );
     if (rollover.dayRolledOver) {
       this.dailyRidership = 0;
       this.dailyCompletedWaitMinSum = 0;
       this.dailyCompletedRiderCount = 0;
       this.demand.resetDailyCounters();
+    }
+    if (rollover.weekRolledOver) {
+      const todRes = this.tod.stepWeeklyTod(this.stations);
+      if (this.manifest && (todRes.stationsUpzoned > 0 || todRes.totalWeightDelta > 0)) {
+        this.dispatch.recomputeFeederCatchments(this.stations, this.manifest.worldUnitsPerKm);
+        this.demand.syncStationMatrix(this.stations);
+        this.emitTopology();
+      }
+    }
+
+    const dispatchChanged = this.dispatch.stepDispatch(
+      this.simTimeSeconds,
+      this.lines.lines,
+      this.stations,
+      this.vehicles,
+      this.economy,
+      (l, fromReserve) => this.spawnVehicleWithStopCheck(l, fromReserve),
+      (l) => this.recallLineVehicleToReserve(l),
+    );
+    if (dispatchChanged) {
+      this.emitTopology();
     }
 
     if (this.pathfinder.isRebuildInProgress()) {
@@ -808,6 +1058,10 @@ export class WorkerSimulationEngine {
       curWaiting = next;
     }
 
+    if (boardedCount > 0) {
+      this.stations.recordBoardings(stationId, boardedCount);
+    }
+
     return boardedCount;
   }
 
@@ -878,6 +1132,14 @@ export class WorkerSimulationEngine {
   }
 
   private emitTopology(): void {
+    const worldUnitsPerKm = this.manifest?.worldUnitsPerKm ?? 100;
+    const feederZones = this.stations.stations
+      .filter((s) => s.feederActive)
+      .map((s) => ({
+        stationId: s.stationId,
+        radiusWorldUnits: s.feederRadiusKm * worldUnitsPerKm,
+      }));
+
     const topology: TopologySnapshot = {
       topologyVersion: this.lines.getTopologyVersion(),
       stations: this.stations.stations.map((s) => ({
@@ -890,12 +1152,16 @@ export class WorkerSimulationEngine {
         subTag: s.subTag,
         concourseTier: s.concourseTier,
         parkAndRideActive: s.parkAndRideActive,
+        feederActive: s.feederActive,
+        feederRadiusKm: s.feederRadiusKm,
         baseProduction: s.baseProduction,
+        weeklyBoardings: s.weeklyBoardings,
         todLevel: s.todLevel,
+        todWeight: Math.round(s.todWeight),
         carryingCapacity: s.carryingCapacity,
       })),
       lines: this.lines.toTopologyLines(),
-      feederZones: [],
+      feederZones,
     };
     this.postOutbound({ type: 'TOPOLOGY_SYNC', topology });
   }
@@ -910,7 +1176,12 @@ export class WorkerSimulationEngine {
             waitingCount: st.waitingCount,
             concourseTier: st.concourseTier,
             parkAndRideActive: st.parkAndRideActive,
+            feederActive: st.feederActive,
+            feederRadiusKm: st.feederRadiusKm,
             baseProduction: st.baseProduction,
+            weeklyBoardings: st.weeklyBoardings,
+            todLevel: st.todLevel,
+            todWeight: Math.round(st.todWeight),
             carryingCapacity: st.carryingCapacity,
           }
         : null;
@@ -927,6 +1198,7 @@ export class WorkerSimulationEngine {
     const mm = String(Math.floor((daySec % 3600) / 60)).padStart(2, '0');
 
     const dailyOpExCad = this.economy.computeDailyOpEx(this.lines.lines, this.stations.stations);
+    const dailyTodTaxCad = this.tod.computeDailyTodTaxCad(this.stations.stations);
 
     const telemetry: TelemetrySnapshot = {
       simDay,
@@ -936,7 +1208,7 @@ export class WorkerSimulationEngine {
       treasuryCad: Math.round(this.economy.getTreasuryCad()),
       bondDebtCad: Math.round(this.economy.getBondDebtCad()),
       dailyFareRevenueCad: Math.round(this.economy.getDailyFareRevenueCad()),
-      dailyTodTaxCad: 0,
+      dailyTodTaxCad,
       dailyOpExCad,
       dailyRidership: this.dailyRidership,
       modeSharePct: Number(this.demand.getModeSharePct().toFixed(1)),
@@ -947,25 +1219,36 @@ export class WorkerSimulationEngine {
       currentAct: 1,
       activeWeather: 'CLEAR',
       activeEvents: [],
-      reservePoolCount: 0,
+      reservePoolCount: this.dispatch.getTotalReserveCount(),
+      reservePoolByMode: this.dispatch.getReservePoolSnapshot(),
       policyDraftPending: false,
       runOutcome: 'ACTIVE',
       activeVehicleCount: this.vehicles.getActiveCount(),
-      lines: this.lines.lines.map((l) => ({
-        lineId: l.lineId,
-        name: l.name,
-        color: l.color,
-        mode: l.mode,
-        vehicleCount: l.vehicleIds.length,
-        stationCount: l.stationIds.length,
-        stationIds: [...l.stationIds],
-        lengthKm: Number(l.totalLengthKm.toFixed(2)),
-        allDoorArc: l.allDoorArc,
-        tspEnabled: l.tspEnabled,
-        consistCars: l.consistCars,
-        totalCapExCad: l.investedCapExCad,
-        dailyOpExCad: this.economy.computeLineDailyOpEx(l),
-      })),
+      stationUnmetCar: this.demand.getOriginUnmetCarSnapshot(this.stations.stations.length),
+      lines: this.lines.lines.map((l) => {
+        const dispatchMetrics = this.dispatch.computeLineMetrics(l, this.stations, this.vehicles);
+        return {
+          lineId: l.lineId,
+          name: l.name,
+          color: l.color,
+          mode: l.mode,
+          vehicleCount: l.vehicleIds.length,
+          stationCount: l.stationIds.length,
+          stationIds: [...l.stationIds],
+          lengthKm: Number(l.totalLengthKm.toFixed(2)),
+          allDoorArc: l.allDoorArc,
+          tspEnabled: l.tspEnabled,
+          consistCars: l.consistCars,
+          totalCapExCad: l.investedCapExCad,
+          dailyOpExCad: this.economy.computeLineDailyOpEx(l),
+          policy: l.policy,
+          actualHeadwaySec: dispatchMetrics.actualHeadwaySec,
+          targetHeadwaySec: dispatchMetrics.targetHeadwaySec,
+          governorState: dispatchMetrics.governorState,
+          upgradeRecommended: dispatchMetrics.upgradeRecommended,
+          avgLoadPct: dispatchMetrics.avgLoadPct,
+        };
+      }),
       selectedInspectorData: this.buildSelectedInspectorData(),
     };
 

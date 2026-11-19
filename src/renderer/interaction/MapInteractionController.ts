@@ -1,10 +1,17 @@
 import type { GeometryPack } from '../../cities/types';
 import type { CrossingType, RouteWaypointInput, TopologyStation } from '../../core/contracts';
+import {
+  extractRiverRings,
+  segmentIntersectsRiverRings,
+  type PolygonRing,
+} from '../../core/stores/lines';
 import type { MapViewport } from '../MapViewport';
 import type { NetworkLayer } from '../layers/NetworkLayer';
 import type { StationLayer } from '../layers/StationLayer';
 
-export type InteractionTool = 'PAN' | 'DRAW_BUS_LINE';
+export { segmentIntersectsRiverRings };
+
+export type InteractionTool = 'PAN' | 'DRAW_BUS_LINE' | 'STAMP_BLUEPRINT';
 
 export interface PendingRiverCrossingInfo {
   fromWaypoint: RouteWaypointInput;
@@ -18,124 +25,8 @@ export interface InteractionCallbacks {
   onDraftChanged: (stopCount: number, editingLineId: number | null) => void;
   onSelectStation?: (stationId: number | null) => void;
   onRequireRiverCrossing?: (info: PendingRiverCrossingInfo) => void;
-}
-
-type Ring = Array<[number, number]>;
-
-function extractRiverRings(geometry?: GeometryPack): Ring[] {
-  if (!geometry) {
-    return [];
-  }
-  const rings: Ring[] = [];
-  for (const feat of geometry.features) {
-    const isRiver =
-      feat.properties.kind === 'RIVER' || feat.properties.id === 'north_saskatchewan_river';
-    if (!isRiver || feat.geometry.type !== 'Polygon') {
-      continue;
-    }
-    const coords = feat.geometry.coordinates as number[][][];
-    for (const ring of coords) {
-      if (ring.length >= 3) {
-        rings.push(ring.map((pt) => [pt[0], pt[1]] as [number, number]));
-      }
-    }
-  }
-  return rings;
-}
-
-function orientation(
-  ax: number,
-  ay: number,
-  bx: number,
-  by: number,
-  cx: number,
-  cy: number,
-): number {
-  const val = (by - ay) * (cx - bx) - (bx - ax) * (cy - by);
-  if (Math.abs(val) < 1e-6) {
-    return 0;
-  }
-  return val > 0 ? 1 : 2;
-}
-
-function onSegment(
-  ax: number,
-  ay: number,
-  bx: number,
-  by: number,
-  px: number,
-  py: number,
-): boolean {
-  return (
-    px <= Math.max(ax, bx) + 1e-6 &&
-    px >= Math.min(ax, bx) - 1e-6 &&
-    py <= Math.max(ay, by) + 1e-6 &&
-    py >= Math.min(ay, by) - 1e-6
-  );
-}
-
-function segmentsIntersect2D(
-  a1x: number,
-  a1y: number,
-  a2x: number,
-  a2y: number,
-  b1x: number,
-  b1y: number,
-  b2x: number,
-  b2y: number,
-): boolean {
-  const o1 = orientation(a1x, a1y, a2x, a2y, b1x, b1y);
-  const o2 = orientation(a1x, a1y, a2x, a2y, b2x, b2y);
-  const o3 = orientation(b1x, b1y, b2x, b2y, a1x, a1y);
-  const o4 = orientation(b1x, b1y, b2x, b2y, a2x, a2y);
-
-  if (o1 !== o2 && o3 !== o4) {
-    return true;
-  }
-  if (o1 === 0 && onSegment(a1x, a1y, a2x, a2y, b1x, b1y)) return true;
-  if (o2 === 0 && onSegment(a1x, a1y, a2x, a2y, b2x, b2y)) return true;
-  if (o3 === 0 && onSegment(b1x, b1y, b2x, b2y, a1x, a1y)) return true;
-  if (o4 === 0 && onSegment(b1x, b1y, b2x, b2y, a2x, a2y)) return true;
-  return false;
-}
-
-function pointInRing(px: number, py: number, ring: Ring): boolean {
-  let inside = false;
-  for (let i = 0, j = ring.length - 1; i < ring.length; j = i++) {
-    const xi = ring[i][0];
-    const yi = ring[i][1];
-    const xj = ring[j][0];
-    const yj = ring[j][1];
-    const intersect = yi > py !== yj > py && px < ((xj - xi) * (py - yi)) / (yj - yi + 1e-9) + xi;
-    if (intersect) {
-      inside = !inside;
-    }
-  }
-  return inside;
-}
-
-export function segmentIntersectsRiverRings(
-  ax: number,
-  ay: number,
-  bx: number,
-  by: number,
-  rings: readonly Ring[],
-): boolean {
-  const midX = (ax + bx) * 0.5;
-  const midY = (ay + by) * 0.5;
-  for (const ring of rings) {
-    if (pointInRing(midX, midY, ring)) {
-      return true;
-    }
-    for (let i = 0; i < ring.length; i++) {
-      const [rx1, ry1] = ring[i];
-      const [rx2, ry2] = ring[(i + 1) % ring.length];
-      if (segmentsIntersect2D(ax, ay, bx, by, rx1, ry1, rx2, ry2)) {
-        return true;
-      }
-    }
-  }
-  return false;
+  onStampBlueprint?: (blueprintId: string, x: number, y: number) => void;
+  onCancelBlueprintStamp?: () => void;
 }
 
 export class MapInteractionController {
@@ -144,10 +35,11 @@ export class MapInteractionController {
   private readonly networkLayer: NetworkLayer;
   private readonly stationLayer: StationLayer;
   private readonly callbacks: InteractionCallbacks;
-  private readonly riverRings: Ring[];
+  private readonly riverRings: PolygonRing[];
   private readonly worldUnitsPerKm: number;
 
   private tool: InteractionTool = 'PAN';
+  private activeBlueprintId: string | null = null;
   private stations: TopologyStation[] = [];
   private draftWaypoints: RouteWaypointInput[] = [];
   private editingLineId: number | null = null;
@@ -217,6 +109,17 @@ export class MapInteractionController {
       return;
     }
 
+    if (e.button === 0 && this.tool === 'STAMP_BLUEPRINT' && this.activeBlueprintId) {
+      const world = this.viewport.screenToWorld(sx, sy);
+      const snapped = this.findSnapStation(world.x, world.y, 25);
+      const px = snapped ? snapped.x : Math.round(world.x);
+      const py = snapped ? snapped.y : Math.round(world.y);
+      const bpId = this.activeBlueprintId;
+      this.setBlueprintStamp(null);
+      this.callbacks.onStampBlueprint?.(bpId, px, py);
+      return;
+    }
+
     if (e.button === 0 && this.tool === 'DRAW_BUS_LINE') {
       this.isDrawingDrag = true;
       this.drawStartScreenX = sx;
@@ -248,6 +151,12 @@ export class MapInteractionController {
       const snapped = this.findSnapStation(world.x, world.y, 25);
       this.stationLayer.setHoverPreview(snapped ? snapped.stationId : null, snapped ? null : world);
       this.refreshPreview();
+    } else if (this.tool === 'STAMP_BLUEPRINT' && this.activeBlueprintId) {
+      const snapped = this.findSnapStation(world.x, world.y, 25);
+      const px = snapped ? snapped.x : Math.round(world.x);
+      const py = snapped ? snapped.y : Math.round(world.y);
+      this.stationLayer.setHoverPreview(snapped ? snapped.stationId : null, null);
+      this.networkLayer.renderBlueprintPreview(this.activeBlueprintId, px, py);
     } else {
       const snapped = this.findSnapStation(world.x, world.y, 25);
       this.stationLayer.setHoverPreview(snapped ? snapped.stationId : null, null);
@@ -266,6 +175,11 @@ export class MapInteractionController {
       }
       if (e.button === 2 && !this.dragMoved && this.tool === 'DRAW_BUS_LINE') {
         this.cancelDraft();
+        return;
+      }
+      if (e.button === 2 && !this.dragMoved && this.tool === 'STAMP_BLUEPRINT') {
+        this.setBlueprintStamp(null);
+        this.callbacks.onCancelBlueprintStamp?.();
         return;
       }
       if (e.button === 0 && !this.dragMoved && this.tool === 'PAN') {
@@ -308,6 +222,9 @@ export class MapInteractionController {
       this.commitDraft();
     } else if (e.key === 'Escape' && this.tool === 'DRAW_BUS_LINE') {
       this.cancelDraft();
+    } else if (e.key === 'Escape' && this.tool === 'STAMP_BLUEPRINT') {
+      this.setBlueprintStamp(null);
+      this.callbacks.onCancelBlueprintStamp?.();
     } else if (e.key === 'Backspace' && this.tool === 'DRAW_BUS_LINE' && !this.pendingCrossingWaypoint) {
       this.undoLastWaypoint();
     }
@@ -349,8 +266,22 @@ export class MapInteractionController {
 
   setTool(tool: InteractionTool): void {
     this.tool = tool;
+    if (tool !== 'STAMP_BLUEPRINT') {
+      this.activeBlueprintId = null;
+    }
     if (tool === 'PAN') {
       this.cancelDraft();
+      this.networkLayer.clearPreview();
+      this.stationLayer.setHoverPreview(null, null);
+    }
+  }
+
+  setBlueprintStamp(blueprintId: string | null): void {
+    this.cancelDraft();
+    this.activeBlueprintId = blueprintId;
+    this.tool = blueprintId ? 'STAMP_BLUEPRINT' : 'PAN';
+    if (!blueprintId) {
+      this.networkLayer.clearPreview();
       this.stationLayer.setHoverPreview(null, null);
     }
   }

@@ -16,10 +16,12 @@ export function TopTelemetryBar() {
   const selectedMode = useGameStore((s) => s.selectedMode);
   const draftStopCount = useGameStore((s) => s.draftStopCount);
   const editingLineId = useGameStore((s) => s.editingLineId);
+  const activeRightPanel = useGameStore((s) => s.activeRightPanel);
   const errorMessage = useGameStore((s) => s.errorMessage);
 
   const setSpeed = useGameStore((s) => s.setSpeed);
   const setActiveTool = useGameStore((s) => s.setActiveTool);
+  const toggleRightPanel = useGameStore((s) => s.toggleRightPanel);
   const requestCommitDraft = useGameStore((s) => s.requestCommitDraft);
   const requestCancelDraft = useGameStore((s) => s.requestCancelDraft);
   const setErrorMessage = useGameStore((s) => s.setErrorMessage);
@@ -33,7 +35,7 @@ export function TopTelemetryBar() {
         <div className="flex items-center gap-3">
           <div>
             <div className="text-sm font-semibold tracking-wide text-slate-100">
-              YEG Transit Architect <span className="text-xs font-normal text-sky-400">v0.3</span>
+              YEG Transit Architect <span className="text-xs font-normal text-sky-400">v0.4</span>
             </div>
             <div className="text-xs text-slate-400">
               Edmonton (YEG) &bull; Week {telemetry.simWeek}, Day {telemetry.simDay} &bull;{' '}
@@ -103,11 +105,47 @@ export function TopTelemetryBar() {
             <div className="text-slate-400">Lines / Fleet</div>
             <div className="font-mono text-sm font-semibold text-slate-100">
               {telemetry.lines.length} / {telemetry.activeVehicleCount}
+              {telemetry.reservePoolCount > 0 && (
+                <span className="ml-1 text-xs text-emerald-300">
+                  (+{telemetry.reservePoolCount} garage)
+                </span>
+              )}
             </div>
           </div>
+
+          {telemetry.dailyTodTaxCad > 0 && (
+            <div>
+              <div className="text-slate-400">TOD Tax</div>
+              <div className="font-mono text-sm font-semibold text-emerald-300">
+                +${telemetry.dailyTodTaxCad}/d
+              </div>
+            </div>
+          )}
         </div>
 
         <div className="flex items-center gap-2">
+          <button
+            type="button"
+            onClick={() => toggleRightPanel('OCC')}
+            className={`rounded-lg border px-2.5 py-1.5 text-xs font-semibold transition ${
+              activeRightPanel === 'OCC'
+                ? 'border-sky-400 bg-sky-500/25 text-sky-100'
+                : 'border-slate-700 bg-slate-900/90 text-slate-200 hover:bg-slate-800'
+            }`}
+          >
+            OCC Auto
+          </button>
+          <button
+            type="button"
+            onClick={() => toggleRightPanel('BLUEPRINTS')}
+            className={`rounded-lg border px-2.5 py-1.5 text-xs font-semibold transition ${
+              activeRightPanel === 'BLUEPRINTS'
+                ? 'border-cyan-400 bg-cyan-500/25 text-cyan-100'
+                : 'border-slate-700 bg-slate-900/90 text-slate-200 hover:bg-slate-800'
+            }`}
+          >
+            Blueprints
+          </button>
           <div className="flex rounded-lg border border-slate-700/80 bg-slate-950/70 p-0.5">
             {SPEED_OPTIONS.map((opt) => {
               const active = telemetry.speed === opt.value;
@@ -135,6 +173,14 @@ export function TopTelemetryBar() {
               className="rounded-lg bg-sky-500 px-3 py-1.5 text-xs font-semibold text-slate-950 transition hover:bg-sky-400"
             >
               Draw Corridor (B)
+            </button>
+          ) : activeTool === 'STAMP_BLUEPRINT' ? (
+            <button
+              type="button"
+              onClick={requestCancelDraft}
+              className="rounded-lg border border-cyan-500/50 bg-cyan-950/80 px-3 py-1.5 text-xs font-semibold text-cyan-200 hover:bg-cyan-900/80"
+            >
+              Cancel Stamp (Esc)
             </button>
           ) : (
             <div className="flex items-center gap-1.5">

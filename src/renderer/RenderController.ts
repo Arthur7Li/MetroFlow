@@ -1,6 +1,10 @@
 import { Application, Container } from 'pixi.js';
 import type { CityManifest, GeometryPack } from '../cities/types';
-import type { TopologySnapshot } from '../core/contracts';
+import type {
+  HeatmapLayerMode,
+  TelemetrySnapshot,
+  TopologySnapshot,
+} from '../core/contracts';
 import type { WorkerClient } from '../core/workerClient';
 import { MapViewport } from './MapViewport';
 import { NetworkLayer } from './layers/NetworkLayer';
@@ -20,6 +24,8 @@ export class RenderController {
   readonly stationLayer = new StationLayer();
   readonly vehicleLayer = new VehicleLayer();
 
+  private heatmapMode: HeatmapLayerMode = 'NONE';
+  private lastHeadwayRatios = new Map<number, number>();
   private rafId: number | null = null;
   private lastFrameMs = 0;
   private initialized = false;
@@ -87,7 +93,28 @@ export class RenderController {
 
   applyTopology(topology: TopologySnapshot): void {
     this.networkLayer.updateTopology(topology.lines, topology.stations);
-    this.stationLayer.updateTopology(topology.stations);
+    this.stationLayer.updateTopology(topology.stations, topology.feederZones);
+  }
+
+  setHeatmapMode(mode: HeatmapLayerMode): void {
+    this.heatmapMode = mode;
+    this.stationLayer.setHeatmapState(mode);
+    this.networkLayer.setHeatmapState(mode, this.lastHeadwayRatios);
+  }
+
+  syncTelemetryOverlays(telemetry: TelemetrySnapshot): void {
+    const nextRatios = new Map<number, number>();
+    for (const line of telemetry.lines) {
+      nextRatios.set(
+        line.lineId,
+        line.actualHeadwaySec / Math.max(1, line.targetHeadwaySec),
+      );
+    }
+    this.lastHeadwayRatios = nextRatios;
+    this.stationLayer.setHeatmapState(this.heatmapMode, telemetry.stationUnmetCar);
+    if (this.heatmapMode === 'HEADWAYS') {
+      this.networkLayer.setHeatmapState('HEADWAYS', nextRatios);
+    }
   }
 
   dispose(): void {

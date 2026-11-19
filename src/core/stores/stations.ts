@@ -1,9 +1,12 @@
 import type { CityNodeSeed, ZoneType } from '../../cities/types';
 import {
   CONCOURSE_UPGRADES,
+  FEEDER_AI_CAPEX_CAD,
+  FEEDER_AI_DEFAULT_RADIUS_KM,
   PARK_AND_RIDE_CAPEX_CAD,
   PARK_AND_RIDE_CAPACITY_PENALTY_RATIO,
   PARK_AND_RIDE_DEMAND_BONUS,
+  PARK_AND_RIDE_MAX_TOD_LEVEL,
 } from '../../config/upgrades';
 import { MAX_STATIONS } from '../contracts';
 import type { StationRenderSoA } from '../memory/sharedBuffers';
@@ -18,13 +21,19 @@ export interface StationRecord {
   subTag?: 'ENTERTAINMENT';
   baseProduction0: number;
   baseProduction: number;
+  baseAttraction0: number;
   baseAttraction: number;
   carryingCapacity0: number;
   carryingCapacity: number;
   todLevel: number;
+  todWeight: number;
+  weeklyBoardings: number;
+  lastWeekBoardings: number;
   concourseTier: 0 | 1 | 2;
   parkAndRideActive: boolean;
   feederActive: boolean;
+  feederRadiusKm: number;
+  feederDemandBonus: number;
   waitingCount: number;
 }
 
@@ -48,13 +57,19 @@ export class StationStore {
         subTag: s.subTag,
         baseProduction0: s.baseProduction,
         baseProduction: s.baseProduction,
+        baseAttraction0: s.baseAttraction,
         baseAttraction: s.baseAttraction,
         carryingCapacity0: s.carryingCapacityK,
         carryingCapacity: s.carryingCapacityK,
         todLevel: 0,
+        todWeight: s.baseProduction,
+        weeklyBoardings: 0,
+        lastWeekBoardings: 0,
         concourseTier: 0,
         parkAndRideActive: false,
         feederActive: false,
+        feederRadiusKm: FEEDER_AI_DEFAULT_RADIUS_KM,
+        feederDemandBonus: 0,
         waitingCount: 0,
       });
     }
@@ -119,17 +134,44 @@ export class StationStore {
       zone: 'R',
       baseProduction0: 250,
       baseProduction: 250,
+      baseAttraction0: 180,
       baseAttraction: 180,
       carryingCapacity0: 1500,
       carryingCapacity: 1500,
       todLevel: 0,
+      todWeight: 250,
+      weeklyBoardings: 0,
+      lastWeekBoardings: 0,
       concourseTier: 0,
       parkAndRideActive: false,
       feederActive: false,
+      feederRadiusKm: FEEDER_AI_DEFAULT_RADIUS_KM,
+      feederDemandBonus: 0,
       waitingCount: 0,
     };
     this.stations.push(created);
     return created;
+  }
+
+  recomputeStationWeights(stationId: number): void {
+    const st = this.stations[stationId];
+    if (!st) {
+      return;
+    }
+    const todScale = st.baseProduction0 > 0 ? st.todWeight / st.baseProduction0 : 1;
+    st.baseProduction =
+      Math.round(st.todWeight) +
+      (st.parkAndRideActive ? PARK_AND_RIDE_DEMAND_BONUS : 0) +
+      (st.feederActive ? st.feederDemandBonus : 0);
+    st.baseAttraction = Math.max(1, Math.round(st.baseAttraction0 * todScale));
+  }
+
+  recordBoardings(stationId: number, count: number): void {
+    const st = this.stations[stationId];
+    if (!st || count <= 0) {
+      return;
+    }
+    st.weeklyBoardings += count;
   }
 
   getConcourseTransitionCost(
@@ -174,15 +216,45 @@ export class StationStore {
       return false;
     }
     st.parkAndRideActive = enabled;
+    st.carryingCapacity = enabled
+      ? Math.round(st.carryingCapacity0 * (1 - PARK_AND_RIDE_CAPACITY_PENALTY_RATIO))
+      : st.carryingCapacity0;
     if (enabled) {
-      st.baseProduction = st.baseProduction0 + PARK_AND_RIDE_DEMAND_BONUS;
-      st.carryingCapacity = Math.round(
-        st.carryingCapacity0 * (1 - PARK_AND_RIDE_CAPACITY_PENALTY_RATIO),
-      );
-    } else {
-      st.baseProduction = st.baseProduction0;
-      st.carryingCapacity = st.carryingCapacity0;
+      st.todLevel = Math.min(PARK_AND_RIDE_MAX_TOD_LEVEL, st.todLevel);
+      st.todWeight = Math.min(st.carryingCapacity, st.todWeight);
     }
+    this.recomputeStationWeights(stationId);
+    return true;
+  }
+
+  getFeederTransitionCost(
+    stationId: number,
+    enabled: boolean,
+  ): { capExCostCad: number; refundOriginalCad: number } | undefined {
+    const st = this.stations[stationId];
+    if (!st || st.feederActive === enabled) {
+      return st ? { capExCostCad: 0, refundOriginalCad: 0 } : undefined;
+    }
+    return enabled
+      ? { capExCostCad: FEEDER_AI_CAPEX_CAD, refundOriginalCad: 0 }
+      : { capExCostCad: 0, refundOriginalCad: FEEDER_AI_CAPEX_CAD };
+  }
+
+  setFeederZone(
+    stationId: number,
+    enabled: boolean,
+    radiusKm = FEEDER_AI_DEFAULT_RADIUS_KM,
+  ): boolean {
+    const st = this.stations[stationId];
+    if (!st) {
+      return false;
+    }
+    st.feederActive = enabled;
+    st.feederRadiusKm = Math.max(0.5, Math.min(5.0, radiusKm));
+    if (!enabled) {
+      st.feederDemandBonus = 0;
+    }
+    this.recomputeStationWeights(stationId);
     return true;
   }
 

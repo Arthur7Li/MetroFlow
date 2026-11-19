@@ -1,8 +1,12 @@
 import {
   CONCOURSE_UPGRADES,
+  FEEDER_AI_CAPEX_CAD,
+  FEEDER_AI_DAILY_OPEX_CAD,
+  FEEDER_AI_DEFAULT_RADIUS_KM,
   PARK_AND_RIDE_CAPEX_CAD,
   PARK_AND_RIDE_DAILY_OPEX_CAD,
   PARK_AND_RIDE_DEMAND_BONUS,
+  TOD_TAX_PER_LEVEL_DAILY_CAD,
 } from '../../config/upgrades';
 import { useGameStore } from '../store/useGameStore';
 
@@ -10,6 +14,9 @@ interface StationInspectorTelemetry {
   kind: 'STATION';
   stationId: number;
   waitingCount: number;
+  todLevel?: number;
+  todWeight?: number;
+  weeklyBoardings?: number;
 }
 
 export function StationInspectorModal() {
@@ -19,6 +26,7 @@ export function StationInspectorModal() {
   const setSelectedStationId = useGameStore((s) => s.setSelectedStationId);
   const upgradeStationConcourse = useGameStore((s) => s.upgradeStationConcourse);
   const toggleParkAndRide = useGameStore((s) => s.toggleParkAndRide);
+  const toggleFeederZone = useGameStore((s) => s.toggleFeederZone);
 
   if (selectedStationId === null || !topology) {
     return null;
@@ -30,10 +38,19 @@ export function StationInspectorModal() {
   }
 
   const inspectorData = telemetry.selectedInspectorData as StationInspectorTelemetry | null;
-  const liveWaiting =
-    inspectorData && inspectorData.kind === 'STATION' && inspectorData.stationId === station.stationId
-      ? inspectorData.waitingCount
-      : null;
+  const matchesStation =
+    inspectorData && inspectorData.kind === 'STATION' && inspectorData.stationId === station.stationId;
+  const liveWaiting = matchesStation ? inspectorData.waitingCount : null;
+  const todLevel = matchesStation && inspectorData.todLevel !== undefined
+    ? inspectorData.todLevel
+    : station.todLevel;
+  const todWeight = matchesStation && inspectorData.todWeight !== undefined
+    ? inspectorData.todWeight
+    : station.todWeight;
+  const weeklyBoardings = matchesStation && inspectorData.weeklyBoardings !== undefined
+    ? inspectorData.weeklyBoardings
+    : station.weeklyBoardings;
+  const todTaxPerDay = todLevel * TOD_TAX_PER_LEVEL_DAILY_CAD;
 
   return (
     <aside className="pointer-events-auto fixed right-3 bottom-3 z-20 flex w-80 flex-col gap-3 rounded-xl border border-slate-700/80 bg-slate-900/92 p-3.5 text-xs text-slate-100 shadow-2xl backdrop-blur-md">
@@ -67,14 +84,28 @@ export function StationInspectorModal() {
           <div className="text-slate-100">{station.baseProduction.toLocaleString('en-CA')}/d</div>
         </div>
         <div>
-          <div className="text-[10px] text-slate-400">Capacity K</div>
+          <div className="text-[10px] text-slate-400">TOD / Cap K</div>
           <div className="text-slate-100">
-            {station.carryingCapacity.toLocaleString('en-CA')}
+            {todWeight}/{station.carryingCapacity}
           </div>
         </div>
         <div>
           <div className="text-[10px] text-slate-400">Waiting</div>
           <div className="text-sky-300">{liveWaiting ?? '—'}</div>
+        </div>
+        <div>
+          <div className="text-[10px] text-slate-400">TOD Tier</div>
+          <div className="text-emerald-300">
+            Lvl {todLevel} {station.parkAndRideActive ? '(Max 4)' : '(Max 5)'}
+          </div>
+        </div>
+        <div>
+          <div className="text-[10px] text-slate-400">Wk Board</div>
+          <div className="text-slate-100">{weeklyBoardings.toLocaleString('en-CA')}</div>
+        </div>
+        <div>
+          <div className="text-[10px] text-slate-400">TOD Tax</div>
+          <div className="text-amber-300">+${todTaxPerDay}/d</div>
         </div>
       </div>
 
@@ -118,7 +149,7 @@ export function StationInspectorModal() {
         })}
       </div>
 
-      <div className="border-t border-slate-800 pt-2">
+      <div className="flex flex-col gap-1.5 border-t border-slate-800 pt-2">
         <button
           type="button"
           onClick={() => toggleParkAndRide(station.stationId, !station.parkAndRideActive)}
@@ -141,6 +172,37 @@ export function StationInspectorModal() {
             {station.parkAndRideActive
               ? `Demolish (+$${Math.round(PARK_AND_RIDE_CAPEX_CAD * 0.75)})`
               : `$${PARK_AND_RIDE_CAPEX_CAD}`}
+          </span>
+        </button>
+
+        <button
+          type="button"
+          onClick={() =>
+            toggleFeederZone(
+              station.stationId,
+              !station.feederActive,
+              FEEDER_AI_DEFAULT_RADIUS_KM,
+            )
+          }
+          className={`flex w-full items-center justify-between rounded-lg border px-2.5 py-2 text-left transition ${
+            station.feederActive
+              ? 'border-cyan-400/70 bg-cyan-500/20 text-cyan-100'
+              : 'border-slate-700 bg-slate-950/60 text-slate-200 hover:bg-slate-800'
+          }`}
+        >
+          <div>
+            <div className="font-semibold">
+              Suburban Feeder AI {station.feederActive ? `(${station.feederRadiusKm} km)` : ''}
+            </div>
+            <div className="text-[10px] text-slate-300">
+              {FEEDER_AI_DEFAULT_RADIUS_KM} km catchment &bull; 0% TOD land loss &bull; $
+              {FEEDER_AI_DAILY_OPEX_CAD}/d
+            </div>
+          </div>
+          <span className="font-mono text-[11px] font-semibold">
+            {station.feederActive
+              ? `Disable (+$${Math.round(FEEDER_AI_CAPEX_CAD * 0.75)})`
+              : `$${FEEDER_AI_CAPEX_CAD.toLocaleString('en-CA')}`}
           </span>
         </button>
       </div>

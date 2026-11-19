@@ -5,6 +5,7 @@ import {
   BOND_WEEKLY_INTEREST_RATE,
   CAPEX_TEARDOWN_REFUND_RATIO,
   CONCOURSE_UPGRADES,
+  FEEDER_AI_DAILY_OPEX_CAD,
   LRV_EXTRA_CAR_DAILY_OPEX_CAD,
   PARK_AND_RIDE_DAILY_OPEX_CAD,
   STARTING_TREASURY_CAD,
@@ -112,7 +113,7 @@ export class EconomySystem {
 
   computeDailyOpEx(
     lines: readonly Pick<TransitLineRecord, 'mode' | 'consistCars' | 'vehicleIds'>[],
-    stations: readonly Pick<StationRecord, 'concourseTier' | 'parkAndRideActive'>[],
+    stations: readonly Pick<StationRecord, 'concourseTier' | 'parkAndRideActive' | 'feederActive'>[],
   ): number {
     let total = 0;
     for (let i = 0; i < lines.length; i++) {
@@ -124,6 +125,9 @@ export class EconomySystem {
       if (st.parkAndRideActive) {
         total += PARK_AND_RIDE_DAILY_OPEX_CAD;
       }
+      if (st.feederActive) {
+        total += FEEDER_AI_DAILY_OPEX_CAD;
+      }
     }
     return total;
   }
@@ -131,7 +135,8 @@ export class EconomySystem {
   stepDayAndWeekRollover(
     simTimeSeconds: number,
     lines: readonly Pick<TransitLineRecord, 'mode' | 'consistCars' | 'vehicleIds'>[],
-    stations: readonly Pick<StationRecord, 'concourseTier' | 'parkAndRideActive'>[],
+    stations: readonly Pick<StationRecord, 'concourseTier' | 'parkAndRideActive' | 'feederActive'>[],
+    dailyTodTaxCad = 0,
   ): RolloverResult {
     const nextDayIndex = Math.floor(simTimeSeconds / 86_400);
     if (nextDayIndex <= this.lastDayIndex) {
@@ -144,6 +149,7 @@ export class EconomySystem {
     let weekRolledOver = false;
 
     for (let day = this.lastDayIndex + 1; day <= nextDayIndex; day++) {
+      this.treasuryCad += dailyTodTaxCad;
       this.treasuryCad -= dailyOpEx;
       totalOpExDeducted += dailyOpEx;
 

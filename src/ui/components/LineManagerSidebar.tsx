@@ -116,7 +116,7 @@ export function LineManagerSidebar() {
           })}
         </div>
 
-        {activeTool === 'PAN' ? (
+        {activeTool !== 'DRAW_BUS_LINE' ? (
           <button
             type="button"
             onClick={() => setActiveTool('DRAW_BUS_LINE')}

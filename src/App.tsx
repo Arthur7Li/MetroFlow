@@ -6,10 +6,13 @@ import type { CityManifest, CityNodeSeed, GeometryPack } from './cities/types';
 import { WorkerClient } from './core/workerClient';
 import { RenderController } from './renderer/RenderController';
 import { MapInteractionController } from './renderer/interaction/MapInteractionController';
+import { BlueprintPalette } from './ui/components/BlueprintPalette';
 import { LineManagerSidebar } from './ui/components/LineManagerSidebar';
+import { OCCAutomationPanel } from './ui/components/OCCAutomationPanel';
 import { RiverCrossingModal } from './ui/components/RiverCrossingModal';
 import { StationInspectorModal } from './ui/components/StationInspectorModal';
 import { TopTelemetryBar } from './ui/components/TopTelemetryBar';
+import { LayerToggles } from './ui/overlays/LayerToggles';
 import { useGameStore } from './ui/store/useGameStore';
 
 const edmontonManifest = edmontonManifestRaw as CityManifest;
@@ -39,6 +42,7 @@ export function App() {
         useGameStore.getState().setTopology(topology);
       },
       onTelemetry: (telemetry) => {
+        renderController.syncTelemetryOverlays(telemetry);
         useGameStore.getState().setTelemetry(telemetry);
       },
       onError: (msg) => {
@@ -68,6 +72,12 @@ export function App() {
         onRequireRiverCrossing: (info) => {
           useGameStore.getState().setPendingRiverCrossing(info);
         },
+        onStampBlueprint: (blueprintId, x, y) => {
+          useGameStore.getState().commitBlueprintStamp(blueprintId, x, y);
+        },
+        onCancelBlueprintStamp: () => {
+          useGameStore.getState().selectBlueprintToStamp(null);
+        },
       },
       edmontonGeometry,
       edmontonManifest.worldUnitsPerKm,
@@ -77,6 +87,8 @@ export function App() {
     store.setHandlers({
       sendCommand: (cmd) => client.sendCommand(cmd),
       setInteractionTool: (tool) => interaction?.setTool(tool),
+      setBlueprintStamp: (blueprintId) => interaction?.setBlueprintStamp(blueprintId),
+      setHeatmapMode: (mode) => renderController.setHeatmapMode(mode),
       startEditingLine: (lineId, existingWaypoints) =>
         interaction?.startEditingLine(lineId, existingWaypoints),
       undoDraftWaypoint: () => interaction?.undoLastWaypoint(),
@@ -127,8 +139,11 @@ export function App() {
       <div ref={canvasHostRef} className="h-full w-full cursor-grab active:cursor-grabbing" />
       <TopTelemetryBar />
       <LineManagerSidebar />
+      <OCCAutomationPanel />
+      <BlueprintPalette />
       <StationInspectorModal />
       <RiverCrossingModal />
+      <LayerToggles />
     </main>
   );
 }
